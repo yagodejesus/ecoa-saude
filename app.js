@@ -53,8 +53,51 @@ const CONFIG = {
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",
   APP_URL: process.env.APP_URL || `http://localhost:${process.env.PORT || 3000}`,
   // 👑 [NOVO] Super admins (e-mails separados por vírgula) — uso ilimitado + painel /admin
-  ADMIN_EMAILS: (process.env.ADMIN_EMAILS || "").split(",").map(e => e.trim().toLowerCase()).filter(Boolean)
+  ADMIN_EMAILS: (process.env.ADMIN_EMAILS || "").split(",").map(e => e.trim().toLowerCase()).filter(Boolean),
+  // 📧 [NOVO] SMTP para e-mails de recuperação de senha (Resend, Gmail, etc)
+  SMTP_HOST: process.env.SMTP_HOST || "",
+  SMTP_PORT: Number(process.env.SMTP_PORT || 587),
+  SMTP_USER: process.env.SMTP_USER || "",
+  SMTP_PASS: process.env.SMTP_PASS || "",
+  SMTP_FROM: process.env.SMTP_FROM || ""
 };
+
+// 📧 [NOVO] Mailer (só inicializa se SMTP estiver configurado)
+let mailer = null;
+if (CONFIG.SMTP_HOST && CONFIG.SMTP_USER) {
+  try {
+    const nodemailer = require("nodemailer");
+    mailer = nodemailer.createTransport({
+      host: CONFIG.SMTP_HOST,
+      port: CONFIG.SMTP_PORT,
+      secure: CONFIG.SMTP_PORT === 465,
+      auth: { user: CONFIG.SMTP_USER, pass: CONFIG.SMTP_PASS }
+    });
+    console.log(`📧 E-mail: SMTP ${CONFIG.SMTP_HOST} configurado`);
+  } catch (e) {
+    console.error("[Email] nodemailer não instalado. Rode: npm install nodemailer");
+  }
+}
+async function sendResetEmail(to, link) {
+  if (!mailer) {
+    // Fallback dev: sem SMTP, o link sai no log do servidor
+    console.log(`\n📧 [RECUPERAÇÃO DE SENHA] SMTP não configurado.\n   Link para ${to}:\n   ${link}\n`);
+    return false;
+  }
+  await mailer.sendMail({
+    from: CONFIG.SMTP_FROM || CONFIG.SMTP_USER,
+    to,
+    subject: "Redefinição de senha — Verifacts",
+    html: `<div style="font-family:Arial,sans-serif; max-width:480px; margin:0 auto;">
+      <h2 style="color:#0a0a0a;">Redefinição de senha</h2>
+      <p>Recebemos um pedido para redefinir a senha da sua conta no <strong>Verifacts</strong>.</p>
+      <p><a href="${link}" style="display:inline-block; background:#0a0a0a; color:#fff; padding:12px 24px; text-decoration:none; border-radius:4px; font-weight:bold;">Criar nova senha</a></p>
+      <p style="color:#666; font-size:13px;">O link é válido por <strong>1 hora</strong> e só pode ser usado uma vez.<br>
+      Se você não pediu a redefinição, ignore este e-mail — sua senha continua a mesma.</p>
+    </div>`
+  });
+  return true;
+}
 
 // 👑 Verifica se o usuário é super admin
 function isAdmin(user) {
@@ -310,6 +353,7 @@ if (process.env.NODE_ENV === "production") {
   if (!process.env.SESSION_SECRET) console.error("⚠️ [SEGURANÇA] SESSION_SECRET não definido em produção — sessões podem ser forjadas!");
   if (CONFIG.STRIPE_SECRET_KEY && !CONFIG.STRIPE_WEBHOOK_SECRET) console.warn("⚠️ [Stripe] STRIPE_WEBHOOK_SECRET não definido — webhooks serão recusados em produção");
   if (CONFIG.STRIPE_SECRET_KEY && CONFIG.APP_URL.includes("localhost")) console.warn("⚠️ [Stripe] APP_URL aponta para localhost — o retorno do checkout vai falhar");
+  if (!CONFIG.SMTP_HOST) console.warn("⚠️ [Email] SMTP não configurado — links de recuperação de senha sairão apenas nos LOGS do servidor (defina SMTP_HOST/USER/PASS)");
 }
 app.use(session({
   store: new SQLiteSessionStore(),
@@ -402,7 +446,8 @@ function rateLimit(maxAttempts, windowMs) {
     b.count++;
     if (b.count > maxAttempts) {
       const waitMin = Math.ceil((b.start + windowMs - now) / 60000);
-      return res.status(429).send(renderAuthPage({ mode: req.path.includes("register") ? "register" : "login", error: `Muitas tentativas. Aguarde ${waitMin} minuto(s) e tente novamente.` }));
+      const mode = req.path.includes("register") ? "register" : req.path.includes("esqueci") ? "esqueci" : "login";
+      return res.status(429).send(renderAuthPage({ mode, error: `Muitas tentativas. Aguarde ${waitMin} minuto(s) e tente novamente.` }));
     }
     next();
   };
@@ -1567,7 +1612,7 @@ function formatResultHtml(result) {
     videoFramesSection = `<div style="background: rgba(30,136,229,0.06); border: 1px solid #1e88e5; border-radius: 2px; padding: 20px; margin-bottom: 20px;">
       <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; color: #1e88e5; text-transform: uppercase; font-weight: 700; margin-bottom: 16px;">🎬 Análise de Frames - Técnicas Ativadas</div>
       <div style="margin-bottom: 16px; padding: 8px; background: #1a1a1a; border-radius: 4px; color: #aaa; font-size: 12px;">IA Detectada (Média): <span style="color: #5b9bd5; font-weight: 700;">${avgAI}%</span></div>
-      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 16px;">`;
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr)); gap: 16px;">`;
     
     result.frameAnalyses.forEach((frame, idx) => {
       const frameAiPct = Math.round((frame.aiProbability || 0) * 100);
@@ -1804,14 +1849,18 @@ function formatResultHtml(result) {
 // ══════════════════════════════════════════════════════════
 // 🔐 PÁGINAS DE LOGIN / REGISTRO
 // ══════════════════════════════════════════════════════════
-function renderAuthPage({ mode = "login", error = "", email = "", name = "", notice = "" }) {
+function renderAuthPage({ mode = "login", error = "", email = "", name = "", notice = "", token = "" }) {
   const isLogin = mode === "login";
+  const isEsqueci = mode === "esqueci";
+  const isRedefinir = mode === "redefinir";
+  const titles = { login: "Entrar", register: "Criar conta", esqueci: "Recuperar senha", redefinir: "Nova senha" };
+  const pageTitle = titles[mode] || "Entrar";
   return `<!doctype html>
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>${isLogin ? "Entrar" : "Criar conta"} · Verifacts</title>
+  <title>${pageTitle} · Verifacts</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Barlow:wght@300;400&display=swap" rel="stylesheet">
@@ -1876,28 +1925,40 @@ function renderAuthPage({ mode = "login", error = "", email = "", name = "", not
     <div class="auth-sub">Verificação de fatos + Detecção de IA</div>
     ${error ? `<div class="auth-error">${escapeHtml(error)}</div>` : ""}
     ${notice ? `<div class="auth-error" style="background:rgba(67,160,71,0.1); border-color:rgba(67,160,71,0.4); color:#81c784;">${escapeHtml(notice)}</div>` : ""}
-    <form method="post" action="${isLogin ? "/login" : "/register"}">
-      ${!isLogin ? `
+    <form method="post" action="${isRedefinir ? "/redefinir" : isEsqueci ? "/esqueci" : isLogin ? "/login" : "/register"}">
+      ${mode === "register" ? `
       <div class="f">
         <label>Nome</label>
         <input type="text" name="name" required minlength="2" maxlength="80" value="${escapeHtml(name)}" placeholder="Seu nome ou organização">
       </div>` : ""}
+      ${!isRedefinir ? `
       <div class="f">
         <label>E-mail</label>
         <input type="email" name="email" required maxlength="120" value="${escapeHtml(email)}" placeholder="voce@empresa.com.br">
+      </div>` : ""}
+      ${isEsqueci ? "" : isRedefinir ? `
+      <input type="hidden" name="token" value="${escapeHtml(token)}">
+      <div class="f">
+        <label>Nova senha</label>
+        <input type="password" name="password" required minlength="6" maxlength="72" placeholder="Mínimo 6 caracteres">
       </div>
+      <div class="f">
+        <label>Confirmar nova senha</label>
+        <input type="password" name="confirm" required minlength="6" maxlength="72" placeholder="Repita a nova senha">
+      </div>` : `
       <div class="f">
         <label>Senha</label>
         <input type="password" name="password" required minlength="6" maxlength="72" placeholder="${isLogin ? "Sua senha" : "Mínimo 6 caracteres"}">
-      </div>
-      <button class="auth-btn" type="submit">${isLogin ? "Entrar" : "Criar conta grátis"}</button>
+      </div>`}
+      ${isLogin ? `<div style="text-align:right; margin:-6px 0 14px;"><a href="/esqueci" style="font-size:13px; color:#5b9bd5;">Esqueceu a senha?</a></div>` : ""}
+      <button class="auth-btn" type="submit">${isRedefinir ? "Salvar nova senha" : isEsqueci ? "Enviar link de recuperação" : isLogin ? "Entrar" : "Criar conta grátis"}</button>
     </form>
     <div class="auth-switch">
-      ${isLogin
-        ? `Não tem conta? <a href="/register">Criar conta</a>`
+      ${isLogin ? `Não tem conta? <a href="/register">Criar conta</a>`
+        : isEsqueci || isRedefinir ? `Lembrou a senha? <a href="/login">Entrar</a>`
         : `Já tem conta? <a href="/login">Entrar</a>`}
     </div>
-    ${!isLogin ? `
+    ${mode === "register" ? `
     <div class="auth-plans">
       Sua conta inicia no plano <b>Grátis</b>: 2 verificações para testar, sem cartão.<br>
       Planos pagos: Starter R$ 129,90 · Profissional R$ 339,90 · Institucional sob consulta
@@ -1964,6 +2025,14 @@ function renderSubPage(title, content, user) {
     .plan-btn[disabled] { opacity:0.35; cursor:default; }
     .plan-btn[disabled]:hover { background:transparent; color:#ccc; border-color:#2e2e2e; }
     footer { border-top:1px solid #222; padding:18px 32px; text-align:center; font-size:13px; color:#555; }
+    /* 📱 [FIX MOBILE] */
+    @media (max-width: 700px) {
+      header { height:auto; min-height:62px; flex-wrap:wrap; padding:10px 16px; gap:8px 12px; }
+      .nav { flex-wrap:wrap; gap:10px 14px; }
+      .wrap { padding:24px 14px 60px; }
+      .card { padding:18px 14px; }
+      table { font-size:12px !important; }
+    }
   </style>
 </head>
 <body>
@@ -2354,6 +2423,68 @@ function renderPage(content = "", user = null) {
       margin-bottom: 20px;
     }
 
+    /* 🎯 Como funciona (método transparente) */
+    .steps-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      padding: 24px 0 6px;
+    }
+    .step { display: flex; gap: 12px; align-items: flex-start; }
+    .step-num {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-size: 26px; font-weight: 700;
+      color: var(--line2);
+      line-height: 1;
+      min-width: 34px;
+    }
+    .step-title {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-size: 15px; font-weight: 600;
+      letter-spacing: 0.04em; text-transform: uppercase;
+      color: var(--white); margin-bottom: 3px;
+    }
+    .step-desc { font-size: 13px; color: var(--muted); line-height: 1.5; }
+
+    /* 🎯 Exemplos clicáveis */
+    .examples-label {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-size: 11px; font-weight: 600;
+      letter-spacing: 0.12em; text-transform: uppercase;
+      color: var(--muted); margin: 14px 0 8px;
+    }
+    .example-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chip {
+      background: var(--bg3);
+      border: 1px solid var(--line2);
+      color: var(--dim);
+      font-family: 'Barlow', sans-serif;
+      font-size: 12.5px;
+      padding: 7px 12px;
+      border-radius: 14px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .chip:hover { border-color: var(--accent-blue, #5b9bd5); color: var(--white); background: rgba(91,155,213,0.08); }
+
+    /* 🎯 Fontes consultadas */
+    .sources-strip {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 22px;
+      margin-top: 20px; padding: 14px 18px;
+      background: var(--bg2, #111);
+      border: 1px solid var(--line);
+      border-radius: 2px;
+      font-size: 13px;
+    }
+    .sources-title {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-size: 12px; font-weight: 600;
+      letter-spacing: 0.1em; text-transform: uppercase;
+      color: var(--muted);
+    }
+    .source-item { color: var(--dim); white-space: nowrap; }
+    .source-sub { color: var(--muted); font-size: 12px; }
+
     .forms-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -2670,6 +2801,20 @@ function renderPage(content = "", user = null) {
     }
     @media (max-width: 820px) { .news-slide { flex: 0 0 calc((100% - 12px) / 2); } }
     @media (max-width: 560px) { .news-slide { flex: 0 0 100%; } }
+
+    /* 📱 [FIX MOBILE] Relatório e header responsivos */
+    .result-body img, .result-wrap img { max-width: 100%; height: auto; }
+    @media (max-width: 700px) {
+      header { height: auto; min-height: 62px; flex-wrap: wrap; padding: 10px 16px; row-gap: 8px; }
+      header > div { flex-wrap: wrap !important; gap: 8px 14px !important; }
+      .verdict-block { flex-direction: column; gap: 14px; }
+      .verdict-right { text-align: left; min-width: 0; width: 100%; }
+      .conf-num { font-size: 32px; }
+      .source-item { white-space: normal; }
+      .sources-strip { gap: 6px 16px; padding: 12px 14px; }
+      .r-meta { flex-wrap: wrap; gap: 8px; }
+      .steps-strip { gap: 10px; padding-top: 16px; }
+    }
     .news-slide:hover { border-color: var(--line2); }
 
     .news-readlink {
@@ -3024,7 +3169,7 @@ function renderPage(content = "", user = null) {
         <form method="post" action="/analyze-text" id="form-text">
           <div class="field">
             <label class="field-label"><span>Conteúdo</span><span id="char-count-content" class="muted">0 / 100</span></label>
-            <textarea class="fi" id="content" name="content" placeholder="Cole texto, notícia ou URL…" maxlength="100"></textarea>
+            <textarea class="fi" id="content" name="content" placeholder="Cole a afirmação, manchete ou URL que deseja verificar…" maxlength="100"></textarea>
           </div>
           <button class="btn" type="submit" id="btn-text">Verificar</button>
           <div class="field-help">Máximo 100 caracteres.</div>
@@ -3036,7 +3181,7 @@ function renderPage(content = "", user = null) {
         <form method="post" action="/analyze-file" enctype="multipart/form-data" id="form-file">
           <div class="field">
             <label class="field-label"><span>Contexto</span><span id="char-count-caption" class="muted">0 / 100</span></label>
-            <input class="fi" type="text" id="caption" name="caption" placeholder="Descreva o contexto da mídia…" maxlength="100">
+            <input class="fi" type="text" id="caption" name="caption" placeholder="Onde você recebeu? O que dizem que a mídia mostra?" maxlength="100">
           </div>
           <div class="field">
             <label class="field-label">Arquivo</label>
@@ -3047,7 +3192,7 @@ function renderPage(content = "", user = null) {
             </div>
           </div>
           <button class="btn" type="submit" id="btn-file">Analisar Mídia</button>
-          <div class="field-help">Requer ffmpeg para vídeos. Máximo 50 caracteres.</div>
+          <div class="field-help">Ex.: print de post viral, foto que parece gerada por IA, vídeo recebido no WhatsApp · JPG, PNG ou MP4 até 80MB.</div>
         </form>
       </div>
     </div>
@@ -3057,7 +3202,7 @@ function renderPage(content = "", user = null) {
     <div class="result-section">
       <div class="result-section-head">Resultado da Verificação</div>
       <div class="result-body">
-        ${content || `<div class="no-result">Nenhuma análise realizada. Submeta um conteúdo acima.</div>`}
+        ${content || `<div class="no-result">Nenhuma análise realizada. Envie um conteúdo acima ou clique em um dos exemplos para ver o relatório completo.</div>`}
       </div>
     </div>
 
@@ -3068,7 +3213,7 @@ function renderPage(content = "", user = null) {
 <!-- FOOTER -->
 <footer>
   <div class="footer-logo">Veri<span>facts</span></div>
-  <div class="footer-note">Análise automatizada · Confirme sempre com fontes primárias</div>
+  <div class="footer-note">Verificação baseada em fontes citadas e datadas · Consulte as fontes primárias antes de publicar</div>
 </footer>
 
 <script>
@@ -3146,6 +3291,12 @@ function renderPage(content = "", user = null) {
   }
 
   // 📜 Histórico por usuário — servidor (o antigo localStorage misturava contas)
+  window.fillExample = function(btn) {
+    var ta = document.getElementById('content');
+    ta.value = btn.getAttribute('data-ex') || '';
+    ta.dispatchEvent(new Event('input'));
+    ta.focus();
+  };
   window.historyUse = function(btn) {
     var ta = document.getElementById('content');
     ta.value = btn.getAttribute('data-text') || '';
@@ -3334,6 +3485,82 @@ app.post("/register", rateLimit(5, 30*60000), (req, res) => {
 
 app.get("/logout", (req, res) => {
   req.session.destroy(() => res.redirect("/login"));
+});
+
+// ══════════════════════════════════════════════════════════
+// 📧 RECUPERAÇÃO DE SENHA (token de uso único, válido por 1h)
+// ══════════════════════════════════════════════════════════
+db.exec(`CREATE TABLE IF NOT EXISTS password_resets (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0
+)`);
+setInterval(() => {
+  try { db.prepare("DELETE FROM password_resets WHERE expires_at < ?").run(Date.now()); } catch (_) {}
+}, 3600000).unref();
+
+function hashResetToken(t) { return crypto.createHash("sha256").update(t).digest("hex"); }
+function findValidReset(token) {
+  const row = db.prepare("SELECT * FROM password_resets WHERE token_hash = ?").get(hashResetToken(token));
+  if (!row || row.used || row.expires_at < Date.now()) return null;
+  return row;
+}
+
+app.get("/esqueci", (req, res) => {
+  if (req.session?.userId) return res.redirect("/");
+  res.send(renderAuthPage({ mode: "esqueci" }));
+});
+
+app.post("/esqueci", rateLimit(5, 30 * 60000), async (req, res) => {
+  const email = String(req.body.email || "").trim();
+  const user = findUserByEmail(email);
+  // Resposta SEMPRE igual (não revela se o e-mail existe — evita enumeração)
+  const generic = "Se este e-mail estiver cadastrado, enviamos um link de redefinição válido por 1 hora. Confira também o spam.";
+  if (user) {
+    try {
+      const token = crypto.randomBytes(32).toString("hex");
+      db.prepare("DELETE FROM password_resets WHERE user_id = ?").run(user.id); // invalida links antigos
+      db.prepare("INSERT INTO password_resets (token_hash, user_id, expires_at) VALUES (?,?,?)")
+        .run(hashResetToken(token), user.id, Date.now() + 3600000);
+      const link = `${CONFIG.APP_URL}/redefinir?token=${token}`;
+      await sendResetEmail(user.email, link);
+      logActivity(user.id, user.email, "senha_reset_solicitado", mailer ? "e-mail enviado" : "link no log (SMTP off)", req);
+    } catch (e) { console.error("[Reset]", e.message); }
+  } else {
+    logActivity(null, email, "senha_reset_solicitado", "e-mail não cadastrado", req);
+  }
+  res.send(renderAuthPage({ mode: "esqueci", notice: generic }));
+});
+
+app.get("/redefinir", (req, res) => {
+  const token = String(req.query.token || "");
+  if (!token || !findValidReset(token)) {
+    return res.send(renderAuthPage({ mode: "esqueci", error: "Link inválido ou expirado. Solicite um novo abaixo." }));
+  }
+  res.send(renderAuthPage({ mode: "redefinir", token }));
+});
+
+app.post("/redefinir", (req, res) => {
+  const { token = "", password = "", confirm = "" } = req.body;
+  const reset = findValidReset(token);
+  if (!reset) {
+    return res.send(renderAuthPage({ mode: "esqueci", error: "Link inválido ou expirado. Solicite um novo abaixo." }));
+  }
+  if (password.length < 6) {
+    return res.send(renderAuthPage({ mode: "redefinir", token, error: "A nova senha deve ter no mínimo 6 caracteres." }));
+  }
+  if (password !== confirm) {
+    return res.send(renderAuthPage({ mode: "redefinir", token, error: "As senhas não conferem." }));
+  }
+  const user = findUserById(reset.user_id);
+  if (!user) return res.send(renderAuthPage({ mode: "esqueci", error: "Conta não encontrada." }));
+  updateUserPassword(user.id, password);
+  db.prepare("UPDATE password_resets SET used = 1 WHERE token_hash = ?").run(hashResetToken(token));
+  // 🔒 Derruba TODAS as sessões ativas do usuário (se alguém estava logado indevidamente, cai)
+  db.prepare("DELETE FROM sessions WHERE sess LIKE ?").run(`%"userId":${user.id}%`);
+  logActivity(user.id, user.email, "senha_redefinida", "via link de recuperação", req);
+  res.redirect("/login?msg=" + encodeURIComponent("Senha redefinida com sucesso! Entre com a nova senha."));
 });
 
 // ══════════════════════════════════════════════════════════
