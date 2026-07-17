@@ -1861,6 +1861,7 @@ function renderAuthPage({ mode = "login", error = "", email = "", name = "", not
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${pageTitle} · Verifacts</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2212%22%20fill%3D%22%230a0a0a%22%2F%3E%3Ctext%20x%3D%2232%22%20y%3D%2244%22%20font-family%3D%22Arial%2Csans-serif%22%20font-size%3D%2234%22%20font-weight%3D%22700%22%20text-anchor%3D%22middle%22%3E%3Ctspan%20fill%3D%22%23f0f0f0%22%3EV%3C%2Ftspan%3E%3Ctspan%20fill%3D%22%23d0312d%22%3EF%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fsvg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Barlow:wght@300;400&display=swap" rel="stylesheet">
@@ -1980,6 +1981,7 @@ function renderSubPage(title, content, user) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${escapeHtml(title)} · Verifacts</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2212%22%20fill%3D%22%230a0a0a%22%2F%3E%3Ctext%20x%3D%2232%22%20y%3D%2244%22%20font-family%3D%22Arial%2Csans-serif%22%20font-size%3D%2234%22%20font-weight%3D%22700%22%20text-anchor%3D%22middle%22%3E%3Ctspan%20fill%3D%22%23f0f0f0%22%3EV%3C%2Ftspan%3E%3Ctspan%20fill%3D%22%23d0312d%22%3EF%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fsvg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Barlow:wght@300;400&display=swap" rel="stylesheet">
@@ -2246,6 +2248,7 @@ function renderPage(content = "", user = null) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Verifacts</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2212%22%20fill%3D%22%230a0a0a%22%2F%3E%3Ctext%20x%3D%2232%22%20y%3D%2244%22%20font-family%3D%22Arial%2Csans-serif%22%20font-size%3D%2234%22%20font-weight%3D%22700%22%20text-anchor%3D%22middle%22%3E%3Ctspan%20fill%3D%22%23f0f0f0%22%3EV%3C%2Ftspan%3E%3Ctspan%20fill%3D%22%23d0312d%22%3EF%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fsvg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Barlow:wght@300;400&display=swap" rel="stylesheet">
@@ -2803,6 +2806,13 @@ function renderPage(content = "", user = null) {
     @media (max-width: 560px) { .news-slide { flex: 0 0 100%; } }
 
     /* 📱 [FIX MOBILE] Relatório e header responsivos */
+    /* Trava estrutural: NADA pode alargar a página além da tela
+       (é o que fazia o iPhone dar zoom-out no relatório) */
+    html, body { max-width: 100vw; overflow-x: hidden; }
+    .result-body, .result-wrap { overflow-wrap: anywhere; }
+    .result-body * { min-width: 0; }
+    .two-col > * { min-width: 0; }
+    .src-list, .reasons-list { min-width: 0; }
     .result-body img, .result-wrap img { max-width: 100%; height: auto; }
     @media (max-width: 700px) {
       header { height: auto; min-height: 62px; flex-wrap: wrap; padding: 10px 16px; row-gap: 8px; }
