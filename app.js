@@ -2805,25 +2805,77 @@ function renderPage(content = "", user = null) {
     @media (max-width: 820px) { .news-slide { flex: 0 0 calc((100% - 12px) / 2); } }
     @media (max-width: 560px) { .news-slide { flex: 0 0 100%; } }
 
-    /* 📱 [FIX MOBILE] Relatório e header responsivos */
-    /* Trava estrutural: NADA pode alargar a página além da tela
-       (é o que fazia o iPhone dar zoom-out no relatório) */
-    html, body { max-width: 100vw; overflow-x: hidden; }
-    .result-body, .result-wrap { overflow-wrap: anywhere; }
-    .result-body * { min-width: 0; }
-    .two-col > * { min-width: 0; }
-    .src-list, .reasons-list { min-width: 0; }
-    .result-body img, .result-wrap img { max-width: 100%; height: auto; }
+    /* ══════════════════════════════════════════════════
+       📱 [FIX MOBILE v2] Relatório 100% responsivo
+       Regra de ouro: nada pode ser mais largo que a tela.
+       ══════════════════════════════════════════════════ */
+
+    /* 1. Trava estrutural da página */
+    html { overflow-x: hidden; }
+    body { width: 100%; max-width: 100%; overflow-x: hidden; }
+    header, footer, .page-layout, .sidebar, .main { max-width: 100%; min-width: 0; }
+
+    /* 2. Nada dentro do relatório pode estourar a largura */
+    .result-section { max-width: 100%; overflow: hidden; }
+    .result-body, .result-wrap {
+      max-width: 100%; min-width: 0;
+      overflow-wrap: anywhere; word-break: break-word;
+    }
+    .result-body *, .result-wrap * { min-width: 0; max-width: 100%; }
+    .result-body img, .result-wrap img { max-width: 100% !important; height: auto; }
+    .two-col > *, .src-list, .reasons-list { min-width: 0; }
+    .verdict-summary { max-width: 100%; }
+    .src-link, .news-readlink, .news-title, .transcript {
+      word-break: break-word; overflow-wrap: anywhere;
+    }
+
+    /* 3. Overlays / tooltips não podem empurrar a tela */
+    .loading-card { width: min(380px, calc(100vw - 28px)); max-width: 100%; }
+    .tech-info[data-tip]::after, .tech-info-tip { max-width: min(230px, 78vw) !important; }
+
     @media (max-width: 700px) {
+      /* header */
       header { height: auto; min-height: 62px; flex-wrap: wrap; padding: 10px 16px; row-gap: 8px; }
       header > div { flex-wrap: wrap !important; gap: 8px 14px !important; }
-      .verdict-block { flex-direction: column; gap: 14px; }
+
+      /* menos padding = mais texto visível */
+      .main { padding: 0 12px 40px; }
+      .result-section-head { padding: 12px 14px; }
+      .result-body { padding: 16px 14px; }
+      .result-wrap { gap: 20px; }
+      .verdict-block { flex-direction: column; gap: 14px; padding: 16px 14px; }
       .verdict-right { text-align: left; min-width: 0; width: 100%; }
       .conf-num { font-size: 32px; }
+      .reply-block { padding: 16px 14px; }
+      .reply-text { font-size: 15.5px; }
+      .reason-t, .src-text { font-size: 14.5px; }
+      .src-item { padding: 12px 13px; }
+      .news-slide { padding: 14px 14px; }
+
+      /* grids viram coluna única — inclui os grids com style inline da seção de IA */
+      .two-col { grid-template-columns: 1fr; }
+      .result-body [style*="grid-template-columns"] { grid-template-columns: 1fr !important; }
+      .result-body [style*="repeat(auto-fill"],
+      .result-body [style*="repeat(auto-fit"] {
+        grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)) !important;
+      }
+
+      /* linhas que antes forçavam largura */
       .source-item { white-space: normal; }
       .sources-strip { gap: 6px 16px; padding: 12px 14px; }
-      .r-meta { flex-wrap: wrap; gap: 8px; }
       .steps-strip { gap: 10px; padding-top: 16px; }
+      .r-meta { flex-wrap: wrap; gap: 8px; }
+      .r-query { width: 100%; }
+      .src-row { flex-wrap: wrap; }
+      .src-rating { text-align: left; }
+    }
+
+    @media (max-width: 420px) {
+      .main { padding: 0 10px 36px; }
+      .result-body { padding: 14px 11px; }
+      .verdict-label { font-size: 19px; }
+      .reply-text { font-size: 15px; }
+      .block-label { font-size: 12px; letter-spacing: 0.1em; }
     }
     .news-slide:hover { border-color: var(--line2); }
 
