@@ -144,7 +144,7 @@ app.post("/webhook/stripe", express.raw({ type: "application/json" }), (req, res
         const s = event.data.object;
         const userId = Number(s.client_reference_id || s.metadata?.userId);
         const plan = s.metadata?.plan;
-        if (userId && ["starter", "profissional"].includes(plan)) {
+        if (userId && ["pessoal", "starter", "profissional"].includes(plan)) {
           updateUserPlan(userId, plan);
           setUserStripe(userId, s.customer, s.subscription);
           logActivity(userId, null, "assinatura_ativada", `plano ${plan} via webhook`); // 📋
@@ -2205,6 +2205,13 @@ function renderPlanosPage(user, q = {}) {
       "Sem cartão de crédito",
       "Plano inicial de toda conta"
     ])}
+    ${planCard("pessoal", [
+      "30 verificações/mês",
+      "Texto, link, imagem e vídeo",
+      "Detecção de IA (22 técnicas)",
+      "Fact-check + notícias",
+      "Ideal para uso pessoal"
+    ])}
     ${planCard("starter", [
       "100 verificações/mês",
       "Texto, link, imagem e vídeo",
@@ -3814,7 +3821,7 @@ app.post("/planos/mudar", requireAuth, (req, res) => {
   }
   const plan = String(req.body.plan || "");
   // Institucional só via contato comercial (evita auto-upgrade para ilimitado)
-  if (!["starter", "profissional"].includes(plan)) {
+  if (!["pessoal", "starter", "profissional"].includes(plan)) {
     return res.redirect("/planos?erro=" + encodeURIComponent("Este plano não pode ser selecionado. O Grátis é apenas para novas contas; para o Institucional, fale com vendas."));
   }
   if (plan === req.user.plan) {
