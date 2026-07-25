@@ -274,20 +274,45 @@ db.exec(`CREATE TABLE IF NOT EXISTS history (
   created_at TEXT NOT NULL
 )`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_history_user ON history (user_id, id DESC)`);
+// 📜 [NOVO] Histórico rico: guarda veredito, resumo e o resultado completo
+// (compartilhado entre o site e o app; permite reabrir sem gastar crédito)
+try { db.exec("ALTER TABLE history ADD COLUMN verdict TEXT"); } catch (_) {}
+try { db.exec("ALTER TABLE history ADD COLUMN summary TEXT"); } catch (_) {}
+try { db.exec("ALTER TABLE history ADD COLUMN result_json TEXT"); } catch (_) {}
+
+// Remove os campos pesados (base64) antes de salvar o resultado no banco
+function serializeResultForHistory(result) {
+  try {
+    const { heatmapBase64, frameBase64s, ...rest } = result || {};
+    if (rest.page && rest.page.bodyText) {
+      rest.page = { ...rest.page, bodyText: String(rest.page.bodyText).slice(0, 1200) };
+    }
+    const json = JSON.stringify(rest);
+    return json.length > 400000 ? null : json; // proteção contra registros gigantes
+  } catch (_) { return null; }
+}
 const MAX_HISTORY_PER_USER = 20;
-function addHistory(userId, text, type) {
+function addHistory(userId, text, type, extra) {
   const t = String(text).trim().slice(0, 500);
   if (!t) return;
   // Remove duplicata do mesmo texto (sobe pro topo)
   db.prepare("DELETE FROM history WHERE user_id = ? AND text = ?").run(userId, t);
-  db.prepare("INSERT INTO history (user_id, text, type, created_at) VALUES (?,?,?,?)").run(userId, t, type || "", new Date().toISOString());
+  const e = extra || {};
+  db.prepare("INSERT INTO history (user_id, text, type, created_at, verdict, summary, result_json) VALUES (?,?,?,?,?,?,?)")
+    .run(userId, t, type || "", new Date().toISOString(),
+         e.verdict || null, e.summary ? String(e.summary).slice(0, 500) : null, e.resultJson || null);
   // Mantém só os últimos N
   db.prepare(`DELETE FROM history WHERE user_id = ? AND id NOT IN (
     SELECT id FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?
   )`).run(userId, userId, MAX_HISTORY_PER_USER);
 }
 function getHistory(userId) {
-  return db.prepare("SELECT id, text, type FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?").all(userId, MAX_HISTORY_PER_USER);
+  return db.prepare("SELECT id, text, type, verdict, summary, created_at FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?").all(userId, MAX_HISTORY_PER_USER);
+}
+function getHistoryResult(userId, id) {
+  const row = db.prepare("SELECT result_json FROM history WHERE user_id = ? AND id = ?").get(userId, id);
+  if (!row || !row.result_json) return null;
+  try { return JSON.parse(row.result_json); } catch (_) { return null; }
 }
 function delHistoryItem(userId, id) {
   db.prepare("DELETE FROM history WHERE user_id = ? AND id = ?").run(userId, id);
@@ -3209,10 +3234,17 @@ function renderPage(content = "", user = null) {
         if (!user) return `<div class="sidebar-empty">Nenhuma busca ainda.</div>`;
         const items = getHistory(user.id);
         if (!items.length) return `<div class="sidebar-empty">Nenhuma busca ainda.</div>`;
+        const V_COLORS = { provavelmente_falso: "var(--c-red)", suspeito: "var(--c-amber)", nao_verificado: "var(--c-blue)", provavelmente_verdadeiro: "var(--c-green)" };
         return `<div class="sidebar-items">` + items.map(h => {
           const label = h.text.length > 60 ? h.text.slice(0, 60) + "…" : h.text;
+          const dot = h.verdict && V_COLORS[h.verdict]
+            ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${V_COLORS[h.verdict]};margin-right:8px;flex-shrink:0;"></span>` : "";
+          // Com resultado salvo → reabre a verificação; sem → reusa o texto na busca
+          const btn = h.verdict
+            ? `<button class="sidebar-item-btn" title="${escapeHtml(h.text)}" onclick="location.href='/historico/ver/${h.id}'" style="display:flex;align-items:center;">${dot}<span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(label)}</span></button>`
+            : `<button class="sidebar-item-btn" title="${escapeHtml(h.text)}" data-text="${escapeHtml(h.text)}" onclick="historyUse(this)">${escapeHtml(label)}</button>`;
           return `<div class="sidebar-item" data-hid="${h.id}">
-            <button class="sidebar-item-btn" title="${escapeHtml(h.text)}" data-text="${escapeHtml(h.text)}" onclick="historyUse(this)">${escapeHtml(label)}</button>
+            ${btn}
             <button class="sidebar-item-del" title="Remover" onclick="historyDel(${h.id}, this)">✕</button>
           </div>`;
         }).join("") + `</div>`;
@@ -3806,7 +3838,8 @@ app.post("/analyze-text", requireAuth, checkUsageLimit, async (req, res) => {
     const urls = extractUrls(content);
     const result = urls.length > 0 ? await analyzeLink(urls[0]) : await analyzeText(content);
     incrementUsage(req.user.id); // 🔐 conta a verificação
-    addHistory(req.user.id, content, urls.length > 0 ? "LINK" : "TEXTO"); // 📜 histórico por usuário
+    addHistory(req.user.id, content, urls.length > 0 ? "LINK" : "TEXTO",
+      { verdict: result.verdict, summary: result.summary, resultJson: serializeResultForHistory(result) }); // 📜
     logActivity(req.user.id, req.user.email, "verificacao", `${urls.length > 0 ? "LINK" : "TEXTO"}: ${content.slice(0, 90)}`, req); // 📋
     res.send(renderPage(formatResultHtml(result), req.user));
   } catch(e) {
@@ -3837,7 +3870,8 @@ app.post("/analyze-file", requireAuth, checkUsageLimit, uploadSafe, async (req, 
     else if (mime.startsWith("video/")) result = await analyzeVideo(filePath, caption);
     else return res.send(renderPage(`<div class="no-result">Tipo não suportado. Envie imagem ou vídeo.</div>`, req.user));
     incrementUsage(req.user.id); // 🔐 conta a verificação
-    addHistory(req.user.id, caption || req.file.originalname || "mídia", "MÍDIA"); // 📜 histórico por usuário
+    addHistory(req.user.id, caption || req.file.originalname || "mídia", "MÍDIA",
+      { verdict: result.verdict, summary: result.summary, resultJson: serializeResultForHistory(result) }); // 📜
     logActivity(req.user.id, req.user.email, "verificacao", `MÍDIA (${mime}): ${req.file.originalname || ""} ${caption ? "| " + caption.slice(0, 60) : ""}`, req); // 📋
     res.send(renderPage(formatResultHtml(result), req.user));
   } catch(e) {
@@ -3852,6 +3886,13 @@ app.post("/analyze-file", requireAuth, checkUsageLimit, uploadSafe, async (req, 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // 📜 [NOVO] Gerenciar histórico (sempre restrito ao próprio usuário)
+// 📜 [NOVO] Reabrir uma verificação salva (sem gastar crédito)
+app.get("/historico/ver/:id", requireAuth, (req, res) => {
+  const result = getHistoryResult(req.user.id, Number(req.params.id));
+  if (!result) return res.redirect("/");
+  res.send(renderPage(formatResultHtml(result), req.user));
+});
+
 app.post("/historico/excluir", requireAuth, (req, res) => {
   const id = Number(req.body?.id);
   if (id) delHistoryItem(req.user.id, id);
@@ -3907,6 +3948,7 @@ app.get("/admin", requireAuth, requireAdmin, (req, res) => {
   if (req.query.ok === "plano") msg = `<div class="msg-ok">✓ Plano do usuário alterado.</div>`;
   if (req.query.ok === "excluido") msg = `<div class="msg-ok">✓ Usuário excluído (sem registro antifraude — pode recriar com trial cheio).</div>`;
   if (req.query.erro) msg = `<div class="msg-err">${escapeHtml(req.query.erro)}</div>`;
+  if (req.query.pushsent) msg = `<div class="msg-ok">🔔 Notificação disparada: ${escapeHtml(req.query.pushsent)}</div>`;
 
   const planOptions = (current) => Object.entries(PLANS).map(([k, p]) =>
     `<option value="${k}" ${k === current ? "selected" : ""}>${p.name}</option>`).join("");
@@ -3939,16 +3981,39 @@ app.get("/admin", requireAuth, requireAdmin, (req, res) => {
       </td>
     </tr>`).join("");
 
+  const pushDevices = db.prepare("SELECT COUNT(*) AS c FROM push_tokens").get().c;
   const content = `
   <div class="page-title">👑 Admin</div>
   <div class="page-sub">Gestão de clientes, planos e atividades. <a href="/admin/logs" style="color:#5b9bd5;">Ver todos os logs →</a></div>
   ${msg}
   <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-bottom:24px;">
-    ${[["Contas", stats.total],["Planos pagos", stats.pagantes],["Assinaturas 💳", stats.assinaturas],["Verif. no mês", stats.verifMes],["Verif. hoje", stats.verifHoje],["Trials usados", stats.trials]].map(([label,val]) => `
+    ${[["Contas", stats.total],["Planos pagos", stats.pagantes],["Assinaturas 💳", stats.assinaturas],["Verif. no mês", stats.verifMes],["Verif. hoje", stats.verifHoje],["Trials usados", stats.trials],["Aparelhos 🔔", pushDevices]].map(([label,val]) => `
     <div class="card" style="margin:0; padding:16px; text-align:center;">
       <div style="font-family:'Barlow Condensed',sans-serif; font-size:28px; font-weight:700; color:#5b9bd5;">${val}</div>
       <div style="font-size:11px; color:#666; text-transform:uppercase; letter-spacing:0.06em;">${label}</div>
     </div>`).join("")}
+  </div>
+
+  <!-- 🔔 DISPARADOR DE NOTIFICAÇÕES -->
+  <div class="card" style="margin-bottom:24px;">
+    <div style="font-family:'Barlow Condensed',sans-serif; font-size:18px; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">🔔 Disparar notificação</div>
+    <div style="color:#888; font-size:14px; margin-bottom:14px;">Envia push para os aparelhos com o app instalado (${pushDevices} registrado${pushDevices === 1 ? "" : "s"}).</div>
+    <form method="post" action="/admin/notificacoes" style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+      <input type="hidden" name="back" value="admin">
+      <div style="grid-column:1 / -1;">
+        <input name="title" maxlength="80" required placeholder="Título (ex.: Nova checagem em destaque)"
+          style="width:100%; background:#111; border:1px solid #222; color:#f0f0f0; font-family:inherit; font-size:15px; padding:10px 12px; border-radius:2px;">
+      </div>
+      <div style="grid-column:1 / -1;">
+        <textarea name="body" maxlength="220" required placeholder="Mensagem (até 220 caracteres)"
+          style="width:100%; min-height:70px; resize:vertical; background:#111; border:1px solid #222; color:#f0f0f0; font-family:inherit; font-size:15px; padding:10px 12px; border-radius:2px;"></textarea>
+      </div>
+      <select name="plan" style="background:#111; border:1px solid #222; color:#f0f0f0; font-family:inherit; font-size:15px; padding:10px 12px; border-radius:2px;">
+        <option value="">Todos os usuários</option>
+        ${Object.keys(PLANS).map(p => `<option value="${p}">${PLANS[p].name}</option>`).join("")}
+      </select>
+      <button type="submit" style="background:#e53935; color:#fff; border:0; padding:12px; font-family:inherit; font-size:14px; font-weight:700; text-transform:uppercase; letter-spacing:2px; cursor:pointer; border-radius:2px;">Disparar</button>
+    </form>
   </div>
   <div class="card" style="overflow-x:auto;">
     <div class="card-title" style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
@@ -3972,6 +4037,76 @@ app.get("/admin", requireAuth, requireAdmin, (req, res) => {
 });
 
 // 👑 Alterar plano de qualquer usuário pelo painel
+// 🔔 [NOVO] Disparador de notificações (admin)
+app.get("/admin/notificacoes", requireAuth, requireAdmin, (req, res) => {
+  const total = db.prepare("SELECT COUNT(*) AS c FROM push_tokens").get().c;
+  const byPlan = db.prepare(`SELECT u.plan, COUNT(*) AS c FROM push_tokens p
+    JOIN users u ON u.id = p.user_id GROUP BY u.plan`).all();
+  const sent = String(req.query.sent || "");
+  res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Notificações — Verifacts Admin</title>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg:#0a0a0a; --card:#181818; --line:#222; --dim:#888; --fg:#f0f0f0; --red:#e53935; }
+    * { box-sizing:border-box; margin:0; }
+    body { background:var(--bg); color:var(--fg); font-family:'Barlow Condensed',sans-serif; padding:32px 16px; }
+    .wrap { max-width:560px; margin:0 auto; }
+    h1 { font-size:30px; text-transform:uppercase; letter-spacing:1px; }
+    h1 span { color:var(--red); }
+    .meta { color:var(--dim); margin:8px 0 24px; font-size:16px; }
+    .card { background:var(--card); border:1px solid var(--line); padding:20px; }
+    label { display:block; font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--dim); margin:14px 0 6px; }
+    input, textarea, select { width:100%; background:#111; border:1px solid var(--line); color:var(--fg);
+      font-family:inherit; font-size:17px; padding:10px 12px; border-radius:2px; }
+    textarea { min-height:90px; resize:vertical; }
+    button { margin-top:20px; width:100%; background:var(--red); color:#fff; border:0; padding:14px;
+      font-family:inherit; font-size:16px; font-weight:700; text-transform:uppercase; letter-spacing:2px; cursor:pointer; border-radius:2px; }
+    .ok { background:#12261a; border:1px solid #43a047; color:#a5d6a7; padding:12px; margin-bottom:16px; font-size:15px; }
+    a { color:var(--dim); font-size:14px; }
+  </style></head><body><div class="wrap">
+    <h1>VERI<span>FACTS</span> — Notificações</h1>
+    <div class="meta">${total} aparelho(s) registrados${byPlan.length ? " · " + byPlan.map(b => `${b.plan}: ${b.c}`).join(" · ") : ""}</div>
+    ${sent ? `<div class="ok">✓ Disparo concluído: ${escapeHtml(sent)}</div>` : ""}
+    <div class="card">
+      <form method="post" action="/admin/notificacoes">
+        <label>Título</label>
+        <input name="title" maxlength="80" required placeholder="Ex.: Nova checagem em destaque">
+        <label>Mensagem</label>
+        <textarea name="body" maxlength="220" required placeholder="Ex.: O boato sobre X foi verificado. Abra e veja as fontes."></textarea>
+        <label>Destinatários</label>
+        <select name="plan">
+          <option value="">Todos os usuários</option>
+          ${Object.keys(PLANS).map(p => `<option value="${p}">${PLANS[p].name}</option>`).join("")}
+        </select>
+        <button type="submit">Disparar notificação</button>
+      </form>
+    </div>
+    <p style="margin-top:16px;"><a href="/admin">← Voltar ao painel</a></p>
+  </div></body></html>`);
+});
+
+app.post("/admin/notificacoes", requireAuth, requireAdmin, async (req, res) => {
+  const title = String(req.body?.title || "").trim().slice(0, 80);
+  const body = String(req.body?.body || "").trim().slice(0, 220);
+  const plan = String(req.body?.plan || "").trim();
+  if (!title || !body) return res.redirect("/admin/notificacoes");
+
+  const rows = plan
+    ? db.prepare(`SELECT p.token FROM push_tokens p JOIN users u ON u.id = p.user_id WHERE u.plan = ?`).all(plan)
+    : db.prepare("SELECT token FROM push_tokens").all();
+
+  const messages = rows.map(r => ({
+    to: r.token, sound: "default", title, body,
+    data: { source: "verifacts-admin" }
+  }));
+  const result = messages.length ? await sendExpoPush(messages) : { ok: 0, fail: 0 };
+  logActivity(req.user.id, req.user.email, "push_admin", `"${title}" → ${plan || "todos"}: ${result.ok} ok, ${result.fail} falhas`, req);
+  const report = `${result.ok} enviada(s), ${result.fail} falha(s)`;
+  if (req.body?.back === "admin") return res.redirect("/admin?pushsent=" + encodeURIComponent(report));
+  res.redirect("/admin/notificacoes?sent=" + encodeURIComponent(report));
+});
+
 app.post("/admin/plano", requireAuth, requireAdmin, (req, res) => {
   const userId = Number(req.body.user_id);
   const plan = String(req.body.plan || "");
@@ -4063,3 +4198,538 @@ app.get("/admin/logs", requireAuth, requireAdmin, (req, res) => {
   const llmInfo = CONFIG.OPENAI_API_KEY ? `OpenAI ${CONFIG.OPENAI_MODEL}` : `Ollama ${CONFIG.OLLAMA_MODEL} (local)`;
   app.listen(CONFIG.PORT, () => console.log(`🤖 Verifacts (IA Detection + Fact Check) em http://localhost:${CONFIG.PORT}\n🧠 LLM: ${llmInfo}`));
 })();
+
+// Insere o plano Pessoal na posição certa (entre Grátis e Starter),
+// preservando a ordem de exibição no site e no app.
+(function addPlanoPessoal() {
+  if (PLANS.pessoal) return; // já existe
+  const old = { ...PLANS };
+  for (const k of Object.keys(PLANS)) delete PLANS[k];
+  PLANS.gratis = old.gratis;
+  PLANS.pessoal = { name: "Pessoal", limit: 30, price: "R$ 19,90/mês" };
+  PLANS.starter = old.starter;
+  PLANS.profissional = old.profissional;
+  PLANS.institucional = old.institucional;
+  // preço em centavos para o checkout Stripe (mesmo padrão dos outros)
+  PLAN_PRICES_BRL.pessoal = 1990;
+  console.log("💚 Plano Pessoal (R$ 19,90) adicionado");
+})();
+
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║  API MOBILE DO VERIFACTS                                                ║
+// ║  Cole ESTE BLOCO INTEIRO dentro do seu app.js, logo ANTES da linha:    ║
+// ║      app.listen(CONFIG.PORT, ...)                                       ║
+// ║                                                                         ║
+// ║  Ele reaproveita tudo que já existe (db, analyzeText, analyzeLink,      ║
+// ║  analyzeImage, createUser, usageInfo, addHistory, getHistory, PLANS,   ║
+// ║  isAdmin, upload, extractUrls...). Não exporta nem duplica nada.        ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+// Parser JSON só para as rotas /api (as rotas web continuam usando form)
+const apiJson = express.json({ limit: "12mb" });
+
+// Tabela de tokens de API (separada das sessões web por cookie)
+db.exec(`CREATE TABLE IF NOT EXISTS api_tokens (
+  token TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  last_used TEXT
+)`);
+
+// 🔔 [NOVO] Tokens de push por usuário (Expo Push)
+db.exec(`CREATE TABLE IF NOT EXISTS push_tokens (
+  token TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  platform TEXT,
+  created_at TEXT NOT NULL
+)`);
+
+// Envia mensagens pela Expo Push API (lotes de 100, como a API exige)
+async function sendExpoPush(messages) {
+  const results = { ok: 0, fail: 0, errors: [] };
+  for (let i = 0; i < messages.length; i += 100) {
+    const chunk = messages.slice(i, i + 100);
+    try {
+      const { data } = await axios.post(
+        "https://exp.host/--/api/v2/push/send",
+        chunk,
+        { headers: { "Content-Type": "application/json" }, timeout: 15000 }
+      );
+      for (const t of (data?.data || [])) {
+        if (t.status === "ok") results.ok++;
+        else {
+          results.fail++;
+          results.errors.push(t.message || t.details?.error || "erro");
+          // token inválido/desregistrado → remove do banco
+          if (t.details?.error === "DeviceNotRegistered" && t.details?.expoPushToken) {
+            try { db.prepare("DELETE FROM push_tokens WHERE token = ?").run(t.details.expoPushToken); } catch (_) {}
+          }
+        }
+      }
+    } catch (e) {
+      results.fail += chunk.length;
+      results.errors.push(e.message);
+    }
+  }
+  return results;
+}
+
+function apiIssueToken(userId) {
+  const token = crypto.randomBytes(32).toString("hex");
+  db.prepare("INSERT INTO api_tokens (token, user_id, created_at) VALUES (?,?,?)")
+    .run(token, userId, new Date().toISOString());
+  return token;
+}
+
+function apiPublicUser(u) {
+  return { id: u.id, email: u.email, plan: u.plan || "gratis", isAdmin: isAdmin(u) };
+}
+
+// Middleware: autentica pelo header "Authorization: Bearer <token>"
+function apiAuth(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ message: "Não autenticado." });
+  const row = db.prepare("SELECT user_id FROM api_tokens WHERE token = ?").get(token);
+  if (!row) return res.status(401).json({ message: "Sessão expirada. Entre novamente." });
+  const user = findUserById(row.user_id);
+  if (!user) return res.status(401).json({ message: "Usuário não encontrado." });
+  db.prepare("UPDATE api_tokens SET last_used = ? WHERE token = ?")
+    .run(new Date().toISOString(), token);
+  req.user = user;
+  next();
+}
+
+// Converte o resultado das funções analyze* pro formato que o app renderiza
+function apiMapResult(r) {
+  // achata as reviews das checagens em itens individuais
+  const factChecks = [];
+  for (const c of (r.factChecks || [])) {
+    for (const rev of (c.reviews || [])) {
+      factChecks.push({
+        publisher: rev.publisher || "",
+        rating: rev.textualRating || "",
+        title: rev.title || c.text || "",
+        url: rev.url || "",
+      });
+    }
+  }
+  const news = (r.recentNews || []).map((n) => ({
+    title: n.title,
+    source: n.source || n.sourceDomain || "",
+    url: n.link,
+    publishedAt: n.pubDate || "",
+  }));
+  let aiDetection;
+  if (r.aiDetection) {
+    const a = r.aiDetection;
+    const indicators = [];
+    if (a.techniques) {
+      for (const [k, t] of Object.entries(a.techniques)) {
+        if (t && t.score > 0) indicators.push(k.replace(/^\d+_/, "").replace(/_/g, " "));
+      }
+    }
+    aiDetection = {
+      isAiGenerated: typeof a.isAI === "boolean" ? a.isAI : (a.aiProbability ?? 0) >= 0.68,
+      score: typeof a.aiProbability === "number" ? a.aiProbability : undefined,
+      indicators,
+    };
+  }
+  return {
+    verdict: r.verdict,          // provavelmente_falso | suspeito | nao_verificado | provavelmente_verdadeiro
+    confidence: r.confidence,
+    summary: r.summary,
+    reply: r.reply,
+    reasons: Array.isArray(r.reasons) ? r.reasons : [],
+    claim: r.claimQuery,
+    factChecks,
+    news,
+    aiDetection,
+  };
+}
+
+// ── AUTH ──────────────────────────────────────────────────────────────────
+app.post("/api/auth/register", apiJson, rateLimit(5, 30 * 60000), (req, res) => {
+  const email = String(req.body?.email || "").trim();
+  const password = String(req.body?.password || "");
+  if (!email || password.length < 6)
+    return res.status(400).json({ message: "E-mail válido e senha (mín. 6) obrigatórios." });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email))
+    return res.status(400).json({ message: "E-mail inválido." });
+  if (findUserByEmail(email))
+    return res.status(409).json({ message: "E-mail já cadastrado. Faça login." });
+
+  const name = email.split("@")[0];
+  const id = createUser({ name, email, password });
+
+  // 🛡️ antifraude: restaura consumo de trial se este e-mail já usou antes
+  try {
+    const prior = getPriorTrialUsage(email);
+    if (prior > 0) {
+      db.prepare(`INSERT INTO usage (user_id, month, count) VALUES (?,?,?)
+        ON CONFLICT(user_id, month) DO UPDATE SET count = MAX(count, excluded.count)`)
+        .run(id, currentMonth(), prior);
+    }
+  } catch (_) {}
+
+  const user = findUserById(id);
+  const token = apiIssueToken(id);
+  logActivity(id, email, "registro", "app mobile", req);
+  res.json({ token, user: apiPublicUser(user) });
+});
+
+app.post("/api/auth/login", apiJson, rateLimit(8, 15 * 60000), (req, res) => {
+  const email = String(req.body?.email || "").trim();
+  const password = String(req.body?.password || "");
+  const user = findUserByEmail(email);
+  if (!user || !bcrypt.compareSync(password, user.password_hash))
+    return res.status(401).json({ message: "E-mail ou senha incorretos." });
+  const token = apiIssueToken(user.id);
+  logActivity(user.id, user.email, "login", "app mobile", req);
+  res.json({ token, user: apiPublicUser(user) });
+});
+
+app.get("/api/me", apiAuth, (req, res) => {
+  const info = usageInfo(req.user);
+  res.json({
+    user: apiPublicUser(req.user),
+    usage: { used: info.used, limit: info.unlimited ? null : info.limit },
+  });
+});
+
+// ── VERIFICAÇÃO ─────────────────────────────────────────────────────────────
+app.post("/api/verify", apiAuth, apiJson, async (req, res) => {
+  const content = String(req.body?.content || "").trim();
+  if (!content) return res.status(400).json({ message: "Envie um texto ou link." });
+
+  const info = usageInfo(req.user);
+  if (!info.unlimited && info.used >= info.limit)
+    return res.status(402).json({ message: "Limite do plano atingido. Faça upgrade para continuar." });
+
+  try {
+    const urls = extractUrls(content);
+    const result = urls.length > 0 ? await analyzeLink(urls[0]) : await analyzeText(content);
+    incrementUsage(req.user.id);
+    addHistory(req.user.id, content, urls.length > 0 ? "LINK" : "TEXTO",
+      { verdict: result.verdict, summary: result.summary, resultJson: serializeResultForHistory(result) });
+    logActivity(req.user.id, req.user.email, "verificacao",
+      `${urls.length > 0 ? "LINK" : "TEXTO"}: ${content.slice(0, 90)}`, req);
+    res.json(apiMapResult(result));
+  } catch (e) {
+    console.error("[api/verify]", e);
+    res.status(500).json({ message: "Falha na verificação." });
+  }
+});
+
+
+// 🔔 [NOVO] Registrar token de push do aparelho
+app.post("/api/push/register", apiAuth, apiJson, (req, res) => {
+  const token = String(req.body?.token || "").trim();
+  const platform = String(req.body?.platform || "").slice(0, 20);
+  if (!token.startsWith("ExponentPushToken")) {
+    return res.status(400).json({ message: "Token de push inválido." });
+  }
+  db.prepare(`INSERT INTO push_tokens (token, user_id, platform, created_at) VALUES (?,?,?,?)
+    ON CONFLICT(token) DO UPDATE SET user_id = excluded.user_id, platform = excluded.platform`)
+    .run(token, req.user.id, platform, new Date().toISOString());
+  res.json({ ok: true });
+});
+
+// ── HISTÓRICO ───────────────────────────────────────────────────────────────
+app.get("/api/history", apiAuth, (req, res) => {
+  const rows = getHistory(req.user.id);
+  res.json(rows.map((r) => ({
+    id: String(r.id),
+    query: r.text,
+    verdict: r.verdict || null,
+    summary: r.summary || (r.type ? `Tipo: ${r.type}` : ""),
+    createdAt: r.created_at || new Date().toISOString(),
+    hasResult: !!r.verdict,
+  })));
+});
+
+// 📜 [NOVO] Resultado completo de um item do histórico (reabrir no app)
+app.get("/api/history/:id/result", apiAuth, async (req, res) => {
+  const result = getHistoryResult(req.user.id, Number(req.params.id));
+  if (!result) return res.status(404).json({ message: "Resultado não disponível para este item." });
+  const mapped = apiMapResult(result);
+  mapped.transcript = result.transcript || "";
+  if (result.aiDetection && result.aiDetection.techniques) {
+    mapped.techniques = apiMapTechniques(result.aiDetection.techniques);
+  }
+  if (Array.isArray(result.frameAnalyses)) {
+    mapped.frames = result.frameAnalyses.map((f, i) => ({
+      frame: f.frameNum || i + 1,
+      isAI: !!f.isAI,
+      score: typeof f.aiProbability === "number" ? f.aiProbability : null,
+      image: null, // miniaturas não são salvas no banco
+      flaggedTechniques: apiMapTechniques(f.techniques).filter((t) => t.flagged).map((t) => t.name),
+    }));
+  }
+  res.json(mapped);
+});
+
+app.delete("/api/history/:id", apiAuth, (req, res) => {
+  delHistoryItem(req.user.id, Number(req.params.id));
+  res.json({ ok: true });
+});
+
+app.delete("/api/history", apiAuth, (req, res) => {
+  clearHistory(req.user.id);
+  res.json({ ok: true });
+});
+
+// ── PLANOS ──────────────────────────────────────────────────────────────────
+app.get("/api/plans", (req, res) => {
+  const feats = {
+    gratis: ["Texto e links", "Checagens do Google", "2 verificações vitalícias"],
+    pessoal: ["Texto, links e imagens", "Detecção de IA", "30 verificações/mês"],
+    starter: ["Texto, links e imagens", "Detecção de IA", "100/mês"],
+    profissional: ["Tudo do Starter", "Análise de vídeo", "1.000/mês"],
+    institucional: ["Verificações ilimitadas", "Multiusuário", "Suporte dedicado"],
+  };
+  res.json(Object.entries(PLANS).map(([id, p]) => ({
+    id,
+    name: p.name,
+    price: p.price,
+    limit: p.limit === -1 ? "Ilimitado" : `${p.limit} verificações/${p.lifetime ? "vitalícias" : "mês"}`,
+    features: feats[id] || [],
+  })));
+});
+
+// "Assinar" no app abre a página de planos do site (fluxo Stripe já existente)
+app.post("/api/checkout", apiAuth, apiJson, async (req, res) => {
+  // Cria a sessão do Stripe e devolve a URL do checkout (mesma lógica do site).
+  if (!stripe) return res.status(501).json({ message: "Pagamentos ainda não configurados." });
+  const plan = String(req.body?.planId || req.body?.plan || "");
+  if (!PLAN_PRICES_BRL[plan]) return res.status(400).json({ message: "Plano inválido." });
+  if (req.user.stripe_subscription_id) {
+    return res.status(409).json({ message: "Você já tem uma assinatura ativa. Gerencie-a no site." });
+  }
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      client_reference_id: String(req.user.id),
+      ...(req.user.stripe_customer_id
+        ? { customer: req.user.stripe_customer_id }
+        : { customer_email: req.user.email }),
+      metadata: { plan, userId: String(req.user.id) },
+      subscription_data: { metadata: { plan, userId: String(req.user.id) } },
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: "brl",
+          unit_amount: PLAN_PRICES_BRL[plan],
+          recurring: { interval: "month" },
+          product_data: {
+            name: `Verifacts ${PLANS[plan] ? PLANS[plan].name : plan}`,
+            description: PLANS[plan] && PLANS[plan].limit === -1
+              ? "Verificações ilimitadas"
+              : `${PLANS[plan] ? PLANS[plan].limit : ""} verificações/mês`
+          }
+        }
+      }],
+      success_url: `${CONFIG.APP_URL}/planos/sucesso?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${CONFIG.APP_URL}/planos?erro=` + encodeURIComponent("Pagamento cancelado. Nenhuma cobrança foi feita.")
+    });
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error("[Stripe] Checkout app:", e.message);
+    res.status(500).json({ message: "Erro ao iniciar pagamento: " + e.message });
+  }
+});
+
+console.log("📱 API mobile do Verifacts montada em /api/*");
+// ╚═══════════════════ FIM DO BLOCO — cole antes do app.listen ════════════╝
+
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║  SUBSTITUIÇÃO: ROTAS DE MÍDIA COM HEATMAP + TÉCNICAS + FRAMES          ║
+// ║                                                                         ║
+// ║  No seu app.js, APAGUE as rotas antigas:                                ║
+// ║     app.post("/api/verify/image", ...)   (bloco inteiro)                ║
+// ║     app.post("/api/verify/video", ...)   (bloco inteiro)                ║
+// ║  e cole ESTE bloco no lugar delas.                                      ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+// Converte o breakdown das 22 técnicas num formato compacto pro app
+function apiMapTechniques(t) {
+  if (!t) return [];
+  return Object.entries(t).map(([k, v]) => ({
+    name: k.replace(/^\d+_/, "").replace(/_/g, " "),
+    flagged: (v?.score || 0) > 0,          // ⚠️ IA
+    value: v?.value != null ? String(v.value) : "",
+    threshold: v?.threshold != null ? String(v.threshold) : "",
+  }));
+}
+
+// Reduz um base64 de imagem para miniatura leve (payload menor no celular)
+async function apiThumb(b64, width = 480) {
+  try {
+    const sharp = require("sharp");
+    const buf = await sharp(Buffer.from(b64, "base64"))
+      .resize({ width, withoutEnlargement: true })
+      .jpeg({ quality: 70 })
+      .toBuffer();
+    return buf.toString("base64");
+  } catch (_) {
+    return b64; // se o sharp falhar, manda o original
+  }
+}
+
+app.post("/api/verify/image", apiAuth, (req, res) => {
+  upload.single("file")(req, res, async (err) => {
+    if (err) return res.status(400).json({ message: err.message || "Erro no upload." });
+    if (!req.file) return res.status(400).json({ message: "Nenhuma imagem enviada." });
+
+    const info = usageInfo(req.user);
+    if (!info.unlimited && info.used >= info.limit) {
+      await cleanup(req.file.path);
+      return res.status(402).json({ message: "Limite do plano atingido." });
+    }
+
+    try {
+      const result = await analyzeImage(req.file.path, req.body?.caption || "");
+      incrementUsage(req.user.id);
+      addHistory(req.user.id, req.file.originalname || "imagem", "MÍDIA",
+        { verdict: result.verdict, summary: result.summary, resultJson: serializeResultForHistory(result) });
+      logActivity(req.user.id, req.user.email, "verificacao", "MÍDIA (app)", req);
+
+      const mapped = apiMapResult(result);
+      // 🔥 Mapa de calor (regiões suspeitas) — mesmo do web
+      mapped.heatmap = result.heatmapBase64
+        ? await apiThumb(result.heatmapBase64, 720)
+        : null;
+      // 🔬 Breakdown das 22 técnicas — mesmo do web
+      mapped.techniques = apiMapTechniques(result.aiDetection?.techniques);
+      res.json(mapped);
+    } catch (e) {
+      console.error("[api/verify/image]", e);
+      res.status(500).json({ message: "Falha ao analisar a imagem." });
+    } finally {
+      await cleanup(req.file.path);
+    }
+  });
+});
+
+app.post("/api/verify/video", apiAuth, (req, res) => {
+  upload.single("file")(req, res, async (err) => {
+    if (err) {
+      const msg = err.code === "LIMIT_FILE_SIZE"
+        ? "Vídeo muito grande. O máximo é 80MB."
+        : (err.message || "Erro no upload.");
+      return res.status(400).json({ message: msg });
+    }
+    if (!req.file) return res.status(400).json({ message: "Nenhum vídeo enviado." });
+    if (!(req.file.mimetype || "").startsWith("video/")) {
+      await cleanup(req.file.path);
+      return res.status(400).json({ message: "Envie um arquivo de vídeo." });
+    }
+
+    const info = usageInfo(req.user);
+    if (!info.unlimited && info.used >= info.limit) {
+      await cleanup(req.file.path);
+      return res.status(402).json({ message: "Limite do plano atingido. Faça upgrade para continuar." });
+    }
+
+    try {
+      const result = await analyzeVideo(req.file.path, req.body?.caption || "");
+      incrementUsage(req.user.id);
+      addHistory(req.user.id, req.file.originalname || "vídeo", "MÍDIA",
+        { verdict: result.verdict, summary: result.summary, resultJson: serializeResultForHistory(result) });
+      logActivity(req.user.id, req.user.email, "verificacao", "VÍDEO (app)", req);
+
+      const mapped = apiMapResult(result);
+      mapped.transcript = result.transcript || "";
+
+      // 🎬 Frames com miniatura + score + técnicas ativadas — mesmo do web
+      const analyses = Array.isArray(result.frameAnalyses) ? result.frameAnalyses : [];
+      const b64s = Array.isArray(result.frameBase64s) ? result.frameBase64s : [];
+      mapped.frames = [];
+      for (let i = 0; i < analyses.length; i++) {
+        const f = analyses[i];
+        mapped.frames.push({
+          frame: f.frameNum || i + 1,
+          isAI: !!f.isAI,
+          score: typeof f.aiProbability === "number" ? f.aiProbability : null,
+          image: b64s[i] ? await apiThumb(b64s[i], 360) : null,
+          flaggedTechniques: apiMapTechniques(f.techniques)
+            .filter((t) => t.flagged)
+            .map((t) => t.name),
+        });
+      }
+      res.json(mapped);
+    } catch (e) {
+      console.error("[api/verify/video]", e);
+      res.status(500).json({ message: "Falha ao analisar o vídeo." });
+    } finally {
+      await cleanup(req.file.path);
+    }
+  });
+});
+
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║  CONTA NO APP: PERFIL, SENHA E EXCLUSÃO                                 ║
+// ║  Cole este bloco no app.js junto dos outros /api/* (antes do listen).   ║
+// ║  Aditivo — não altera nenhuma rota existente.                           ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+// Dados da conta (nome, e-mail, data de criação)
+app.get("/api/account", apiAuth, (req, res) => {
+  res.json({
+    name: req.user.name || "",
+    email: req.user.email,
+    createdAt: req.user.created_at || null,
+  });
+});
+
+// Atualizar nome (e-mail não pode ser alterado — é a identidade da conta)
+app.post("/api/account/profile", apiAuth, apiJson, (req, res) => {
+  const name = String(req.body?.name || "").trim();
+  if (name.length < 2 || name.length > 80) {
+    return res.status(400).json({ message: "Nome deve ter entre 2 e 80 caracteres." });
+  }
+  db.prepare("UPDATE users SET name = ? WHERE id = ?").run(name, req.user.id);
+  logActivity(req.user.id, req.user.email, "perfil_alterado", "app mobile", req);
+  res.json({ ok: true, name });
+});
+
+// Alterar senha (exige a senha atual; derruba as outras sessões do app)
+app.post("/api/account/password", apiAuth, apiJson, (req, res) => {
+  const current = String(req.body?.current || "");
+  const next = String(req.body?.next || "");
+  if (!bcrypt.compareSync(current, req.user.password_hash)) {
+    return res.status(401).json({ message: "Senha atual incorreta." });
+  }
+  if (next.length < 6) {
+    return res.status(400).json({ message: "A nova senha deve ter no mínimo 6 caracteres." });
+  }
+  db.prepare("UPDATE users SET password_hash = ? WHERE id = ?")
+    .run(bcrypt.hashSync(next, 10), req.user.id);
+  // invalida os outros tokens do app (mantém só a sessão atual)
+  db.prepare("DELETE FROM api_tokens WHERE user_id = ? AND token != ?")
+    .run(req.user.id, req.apiToken);
+  logActivity(req.user.id, req.user.email, "senha_alterada", "app mobile", req);
+  res.json({ ok: true });
+});
+
+// Excluir conta (exige senha; mantém apenas o hash antifraude do trial,
+// conforme a Política de Privacidade)
+app.post("/api/account/delete", apiAuth, apiJson, (req, res) => {
+  const password = String(req.body?.password || "");
+  if (!bcrypt.compareSync(password, req.user.password_hash)) {
+    return res.status(401).json({ message: "Senha incorreta." });
+  }
+  const uid = req.user.id;
+  const email = req.user.email;
+  try {
+    // registra o consumo do trial no hash antifraude ANTES de apagar
+    recordTrialUsage(email, getTotalUsage(uid));
+  } catch (_) {}
+  db.prepare("DELETE FROM push_tokens WHERE user_id = ?").run(uid);
+  db.prepare("DELETE FROM api_tokens WHERE user_id = ?").run(uid);
+  deleteUser(uid); // apaga uso + histórico + usuário
+  logActivity(uid, email, "conta_excluida", "app mobile", req);
+  res.json({ ok: true });
+});
+
+console.log("👤 Rotas de conta do app montadas em /api/account/*");
