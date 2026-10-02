@@ -48,9 +48,6 @@ const CONFIG = {
   WHISPER_MODEL: process.env.WHISPER_MODEL || "",
   MAX_NEWS_ITEMS: Number(process.env.MAX_NEWS_ITEMS || 15),
   NEWS_LOOKBACK_DAYS: Number(process.env.NEWS_LOOKBACK_DAYS || 90),
-  // 💳 [NOVO] Stripe (pagamentos por assinatura)
-  STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
-  STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",
   APP_URL: process.env.APP_URL || `http://localhost:${process.env.PORT || 3000}`,
   // 👑 [NOVO] Super admins (e-mails separados por vírgula) — uso ilimitado + painel /admin
   ADMIN_EMAILS: (process.env.ADMIN_EMAILS || "").split(",").map(e => e.trim().toLowerCase()).filter(Boolean),
@@ -87,10 +84,10 @@ async function sendResetEmail(to, link) {
   await mailer.sendMail({
     from: CONFIG.SMTP_FROM || CONFIG.SMTP_USER,
     to,
-    subject: "Redefinição de senha — Verifacts",
+    subject: "Redefinição de senha — Ecoa Saúde",
     html: `<div style="font-family:Arial,sans-serif; max-width:480px; margin:0 auto;">
       <h2 style="color:#0a0a0a;">Redefinição de senha</h2>
-      <p>Recebemos um pedido para redefinir a senha da sua conta no <strong>Verifacts</strong>.</p>
+      <p>Recebemos um pedido para redefinir a senha da sua conta no <strong>Ecoa Saúde</strong>.</p>
       <p><a href="${link}" style="display:inline-block; background:#0a0a0a; color:#fff; padding:12px 24px; text-decoration:none; border-radius:4px; font-weight:bold;">Criar nova senha</a></p>
       <p style="color:#666; font-size:13px;">O link é válido por <strong>1 hora</strong> e só pode ser usado uma vez.<br>
       Se você não pediu a redefinição, ignore este e-mail — sua senha continua a mesma.</p>
@@ -103,79 +100,6 @@ async function sendResetEmail(to, link) {
 function isAdmin(user) {
   return !!user && CONFIG.ADMIN_EMAILS.includes(String(user.email).toLowerCase());
 }
-
-// 💳 [NOVO] Cliente Stripe (só inicializa se a chave existir)
-let stripe = null;
-if (CONFIG.STRIPE_SECRET_KEY) {
-  try {
-    // timeout 25s (em vez de 80s) + 2 retentativas automáticas em falha de rede
-    stripe = require("stripe")(CONFIG.STRIPE_SECRET_KEY, { timeout: 25000, maxNetworkRetries: 2 });
-  } catch (e) {
-    console.error("[Stripe] Pacote não instalado. Rode: npm install stripe");
-  }
-}
-
-// 💳 [NOVO] Webhook do Stripe — PRECISA vir antes do express.json()
-// (a verificação de assinatura exige o body cru, não parseado)
-app.post("/webhook/stripe", express.raw({ type: "application/json" }), (req, res) => {
-  if (!stripe) return res.status(400).send("Stripe não configurado");
-  let event;
-  try {
-    if (CONFIG.STRIPE_WEBHOOK_SECRET) {
-      event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], CONFIG.STRIPE_WEBHOOK_SECRET);
-    } else if (process.env.NODE_ENV === "production") {
-      // 🔒 [SEGURANÇA] Em produção, webhook sem assinatura = qualquer um poderia
-      // forjar um "pagamento concluído" e ganhar plano de graça. Recusar.
-      console.error("[Stripe] Webhook recusado: STRIPE_WEBHOOK_SECRET não configurado em produção");
-      return res.status(400).send("Webhook não verificado");
-    } else {
-      event = JSON.parse(req.body); // apenas em desenvolvimento local
-      console.warn("[Stripe] Webhook SEM verificação de assinatura — defina STRIPE_WEBHOOK_SECRET em produção");
-    }
-  } catch (e) {
-    console.error("[Stripe] Webhook inválido:", e.message);
-    return res.status(400).send(`Webhook error: ${e.message}`);
-  }
-
-  try {
-    switch (event.type) {
-      // Pagamento concluído → ativar plano
-      case "checkout.session.completed": {
-        const s = event.data.object;
-        const userId = Number(s.client_reference_id || s.metadata?.userId);
-        const plan = s.metadata?.plan;
-        if (userId && ["pessoal", "starter", "profissional"].includes(plan)) {
-          updateUserPlan(userId, plan);
-          setUserStripe(userId, s.customer, s.subscription);
-          logActivity(userId, null, "assinatura_ativada", `plano ${plan} via webhook`); // 📋
-          console.log(`[Stripe] ✓ Assinatura ativada: user ${userId} → ${plan}`);
-        }
-        break;
-      }
-      // Assinatura cancelada/encerrada → voltar pro grátis
-      case "customer.subscription.deleted": {
-        const sub = event.data.object;
-        const user = findUserByStripeSubscription(sub.id);
-        if (user) {
-          updateUserPlan(user.id, "gratis");
-          setUserStripe(user.id, user.stripe_customer_id, null);
-          logActivity(user.id, user.email, "assinatura_cancelada", "rebaixado para gratis via webhook"); // 📋
-          console.log(`[Stripe] ✗ Assinatura cancelada: ${user.email} → gratis`);
-        }
-        break;
-      }
-      // Falha de cobrança (cartão recusado na renovação)
-      case "invoice.payment_failed": {
-        const inv = event.data.object;
-        console.warn(`[Stripe] ⚠ Falha de pagamento: customer ${inv.customer}`);
-        break;
-      }
-    }
-  } catch (e) {
-    console.error("[Stripe] Erro processando webhook:", e.message);
-  }
-  res.json({ received: true });
-});
 
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -190,17 +114,8 @@ const upload = multer({
 });
 
 // ══════════════════════════════════════════════════════════
-// 🔐 AUTENTICAÇÃO + PLANOS + LIMITES DE USO
+// 🔐 AUTENTICAÇÃO E CONTAGEM DE USO
 // ══════════════════════════════════════════════════════════
-
-// Planos (alinhados com a estratégia de pricing)
-// "lifetime: true" = limite TOTAL da conta (não renova por mês)
-const PLANS = {
-  gratis:        { name: "Grátis",        limit: 2,    price: "R$ 0",         lifetime: true },
-  starter:       { name: "Starter",       limit: 100,  price: "R$ 129,90/mês" },
-  profissional:  { name: "Profissional",  limit: 1000, price: "R$ 339,90/mês" },
-  institucional: { name: "Institucional", limit: -1,   price: "Sob consulta" } // -1 = ilimitado
-};
 
 // Banco SQLite (no Railway, use um Volume montado e defina DB_PATH)
 const DB_PATH = process.env.DB_PATH || "./verifacts.db";
@@ -222,48 +137,6 @@ db.exec(`
     PRIMARY KEY (user_id, month)
   );
 `);
-// 💳 [NOVO] Migração: colunas do Stripe (ignora erro se já existirem)
-try { db.exec("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT"); } catch (_) {}
-try { db.exec("ALTER TABLE users ADD COLUMN stripe_subscription_id TEXT"); } catch (_) {}
-
-// 🛡️ [ANTIFRAUDE] Registro de teste grátis por e-mail (sobrevive à exclusão da conta)
-// Guarda apenas um HASH do e-mail (não o e-mail) + quanto do trial foi usado.
-// Impede o golpe: criar conta → gastar 2 grátis → excluir → recriar → repetir.
-db.exec(`CREATE TABLE IF NOT EXISTS trial_registry (
-  email_hash TEXT PRIMARY KEY,
-  trial_used INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT
-)`);
-
-// Normaliza o e-mail para o hash antifraude:
-// - minúsculas e trim
-// - remove alias "+qualquercoisa" (yago+1@gmail.com → yago@gmail.com)
-// - no Gmail, remove pontos do usuário (y.a.go@gmail.com → yago@gmail.com)
-function normalizeEmailForTrial(email) {
-  let [local, domain] = String(email).trim().toLowerCase().split("@");
-  if (!domain) return String(email).trim().toLowerCase();
-  local = local.split("+")[0];
-  if (domain === "gmail.com" || domain === "googlemail.com") {
-    local = local.replace(/\./g, "");
-    domain = "gmail.com";
-  }
-  return `${local}@${domain}`;
-}
-function emailTrialHash(email) {
-  return crypto.createHash("sha256").update(normalizeEmailForTrial(email)).digest("hex");
-}
-function recordTrialUsage(email, used) {
-  const h = emailTrialHash(email);
-  db.prepare(`
-    INSERT INTO trial_registry (email_hash, trial_used, updated_at) VALUES (?, ?, ?)
-    ON CONFLICT(email_hash) DO UPDATE SET trial_used = MAX(trial_used, excluded.trial_used), updated_at = excluded.updated_at
-  `).run(h, used, new Date().toISOString());
-}
-function getPriorTrialUsage(email) {
-  const row = db.prepare("SELECT trial_used FROM trial_registry WHERE email_hash = ?").get(emailTrialHash(email));
-  return row ? row.trial_used : 0;
-}
-
 // 📜 [NOVO] Histórico de buscas POR USUÁRIO (antes era localStorage — compartilhado
 // entre contas no mesmo navegador e invisível em outros dispositivos)
 db.exec(`CREATE TABLE IF NOT EXISTS history (
@@ -376,8 +249,6 @@ app.set("trust proxy", 1); // necessário atrás do proxy do Railway
 // 🔒 [SEGURANÇA] Alertas de configuração insegura em produção
 if (process.env.NODE_ENV === "production") {
   if (!process.env.SESSION_SECRET) console.error("⚠️ [SEGURANÇA] SESSION_SECRET não definido em produção — sessões podem ser forjadas!");
-  if (CONFIG.STRIPE_SECRET_KEY && !CONFIG.STRIPE_WEBHOOK_SECRET) console.warn("⚠️ [Stripe] STRIPE_WEBHOOK_SECRET não definido — webhooks serão recusados em produção");
-  if (CONFIG.STRIPE_SECRET_KEY && CONFIG.APP_URL.includes("localhost")) console.warn("⚠️ [Stripe] APP_URL aponta para localhost — o retorno do checkout vai falhar");
   if (!CONFIG.SMTP_HOST) console.warn("⚠️ [Email] SMTP não configurado — links de recuperação de senha sairão apenas nos LOGS do servidor (defina SMTP_HOST/USER/PASS)");
 }
 app.use(session({
@@ -394,33 +265,23 @@ app.use(session({
 }));
 
 // ── Helpers de usuário ──
-function createUser({ name, email, password, plan = "gratis" }) {
+function createUser({ name, email, password }) {
   const hash = bcrypt.hashSync(password, 10);
   const stmt = db.prepare("INSERT INTO users (name,email,password_hash,plan,created_at) VALUES (?,?,?,?,?)");
-  const info = stmt.run(name.trim(), email.trim().toLowerCase(), hash, plan, new Date().toISOString());
+  const info = stmt.run(name.trim(), email.trim().toLowerCase(), hash, "ilimitado", new Date().toISOString());
   return info.lastInsertRowid;
 }
 function findUserByEmail(email) {
   return db.prepare("SELECT * FROM users WHERE email = ?").get(String(email).trim().toLowerCase());
 }
 function findUserById(id) {
-  return db.prepare("SELECT id,name,email,plan,created_at,stripe_customer_id,stripe_subscription_id FROM users WHERE id = ?").get(id);
-}
-// 💳 [NOVO] Helpers do Stripe
-function setUserStripe(id, customerId, subscriptionId) {
-  db.prepare("UPDATE users SET stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ?").run(customerId || null, subscriptionId || null, id);
-}
-function findUserByStripeSubscription(subId) {
-  return db.prepare("SELECT * FROM users WHERE stripe_subscription_id = ?").get(subId);
+  return db.prepare("SELECT id,name,email,created_at FROM users WHERE id = ?").get(id);
 }
 function updateUserName(id, name) {
   db.prepare("UPDATE users SET name = ? WHERE id = ?").run(String(name).trim(), id);
 }
 function updateUserPassword(id, password) {
   db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(bcrypt.hashSync(password, 10), id);
-}
-function updateUserPlan(id, plan) {
-  db.prepare("UPDATE users SET plan = ? WHERE id = ?").run(plan, id);
 }
 function getUserWithHash(id) {
   return db.prepare("SELECT * FROM users WHERE id = ?").get(id);
@@ -432,7 +293,7 @@ function getUsage(userId) {
   const row = db.prepare("SELECT count FROM usage WHERE user_id = ? AND month = ?").get(userId, currentMonth());
   return row ? row.count : 0;
 }
-// 🔴 [NOVO] Uso total da conta (para plano grátis: 2 verificações VITALÍCIAS)
+// Uso total da conta (contador acumulado, só informativo)
 function getTotalUsage(userId) {
   const row = db.prepare("SELECT COALESCE(SUM(count),0) AS c FROM usage WHERE user_id = ?").get(userId);
   return row.c;
@@ -443,14 +304,9 @@ function incrementUsage(userId) {
     ON CONFLICT(user_id, month) DO UPDATE SET count = count + 1
   `).run(userId, currentMonth());
 }
-function planOf(user) { return PLANS[user.plan] || PLANS.gratis; }
+// 🆓 Sem planos e sem limites: o uso é só um contador informativo
 function usageInfo(user) {
-  const plan = planOf(user);
-  const lifetime = !!plan.lifetime;
-  const used = lifetime ? getTotalUsage(user.id) : getUsage(user.id);
-  // 👑 Admin = sempre ilimitado, independente do plano
-  const unlimited = plan.limit === -1 || isAdmin(user);
-  return { used, limit: plan.limit, unlimited, lifetime: lifetime && !unlimited, remaining: unlimited ? Infinity : Math.max(0, plan.limit - used), planName: isAdmin(user) ? "Admin" : plan.name };
+  return { used: getUsage(user.id), total: getTotalUsage(user.id), unlimited: true };
 }
 // 🔴 [NOVO] Exclusão de conta (apaga uso + histórico + usuário)
 function deleteUser(userId) {
@@ -490,23 +346,6 @@ function requireAuth(req, res, next) {
   }
   return res.redirect("/login");
 }
-function checkUsageLimit(req, res, next) {
-  const info = usageInfo(req.user);
-  if (!info.unlimited && info.used >= info.limit) {
-    const isGratis = req.user.plan === "gratis";
-    return res.send(renderPage(`
-      <div style="text-align:center; padding: 40px 20px;">
-        <div style="font-family:'Barlow Condensed',sans-serif; font-size:28px; font-weight:700; color:#fb8c00; text-transform:uppercase; margin-bottom:12px;">${isGratis ? "Teste grátis esgotado" : "Limite mensal atingido"}</div>
-        <p style="color:#aaa; font-size:15px; max-width:480px; margin:0 auto 20px;">${isGratis
-          ? `Você usou suas <strong style="color:#fff;">2 verificações gratuitas</strong>. Assine um plano para continuar verificando conteúdos.`
-          : `Você usou todas as <strong style="color:#fff;">${info.limit} verificações</strong> do plano ${info.planName} este mês. Faça upgrade para continuar verificando.`}</p>
-        <a href="/planos" style="display:inline-block; background:#f0f0f0; color:#0a0a0a; padding:12px 28px; border-radius:2px; font-family:'Barlow Condensed',sans-serif; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; font-size:14px;">Ver planos</a>
-      </div>
-    `, req.user));
-  }
-  next();
-}
-
 async function ensureTempDir() {
   await fs.ensureDir(CONFIG.TEMP_DIR);
   await fs.ensureDir(path.join(CONFIG.TEMP_DIR, "uploads"));
@@ -1152,7 +991,7 @@ async function scrapeUrl(url) {
       bodyText: `
 ⚠️ SOLUÇÃO:
 1. Baixe o vídeo usando um app como SnapInsta ou similar
-2. Envie o arquivo MP4 como "Imagem ou Vídeo" no Verifacts
+2. Envie o arquivo MP4 anexando no botão + do Ecoa Saúde
 3. Nossa IA analisará se é gerado ou real
 
 🎯 Por que não funciona?
@@ -1171,7 +1010,7 @@ Mas você pode analisar o vídeo como arquivo!
 ⚠️ SOLUÇÃO:
 1. Abra o link no navegador
 2. Baixe o vídeo (sem marca d'água se possível)
-3. Envie como "Imagem ou Vídeo" no Verifacts
+3. Envie anexando no botão + do Ecoa Saúde
 
 Nossa IA analisará se é gerado com IA ou é real!
       `.trim()
@@ -1598,35 +1437,35 @@ function formatResultHtml(result) {
     const isAPI = source.includes('replicate');
     
     const aiStatus = aiPct > 70 ? "⚠️ POSSÍVEL IA" : aiPct > 40 ? "⚠️ SUSPEITA" : "✓ AUTÊNTICA";
-    const aiColor = aiPct > 70 ? "#e53935" : aiPct > 40 ? "#fb8c00" : "#43a047";
+    const aiColor = aiPct > 70 ? "#C62828" : aiPct > 40 ? "#B45F06" : "#2E8B57";
     
-    aiSection = `<div style="background: rgba(30,136,229,0.06); border: 1px solid #1e88e5; border-radius: 2px; padding: 20px; margin-bottom: 20px;">
-      <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; color: #1e88e5; text-transform: uppercase; font-weight: 700; margin-bottom: 16px;">
+    aiSection = `<div style="background: #EEF3FC; border: 1px solid #CCDAF3; border-radius: 18px; padding: 20px; margin-bottom: 20px;">
+      <div style="font-size: 12px; color: #2560CC; text-transform: uppercase; font-weight: 700; margin-bottom: 16px;">
         🔍 Detecção de IA ${isAPI ? '(via Replicate 🤖)' : '(análise local)'}
       </div>
       <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 16px;">
         <div>
-          <div style="color: #888; font-size: 12px; margin-bottom: 8px;">Probabilidade de IA</div>
+          <div style="color: #6B7280; font-size: 12px; margin-bottom: 8px;">Probabilidade de IA</div>
           <div style="font-size: 28px; font-weight: 700; color: ${aiColor};">${aiPct}%</div>
-          <div style="color: #aaa; font-size: 12px; margin-top: 4px;">${aiStatus}</div>
+          <div style="color: #4A5260; font-size: 12px; margin-top: 4px;">${aiStatus}</div>
         </div>
         <div>
-          <div style="color: #888; font-size: 12px; margin-bottom: 8px;">Confiança</div>
-          <div style="font-size: 28px; font-weight: 700; color: #5b9bd5;">${confPct}%</div>
-          <div style="color: #aaa; font-size: 12px; margin-top: 4px;">${isAPI ? 'Modelo IA' : 'Heurística'}</div>
+          <div style="color: #6B7280; font-size: 12px; margin-bottom: 8px;">Confiança</div>
+          <div style="font-size: 28px; font-weight: 700; color: #2560CC;">${confPct}%</div>
+          <div style="color: #4A5260; font-size: 12px; margin-top: 4px;">${isAPI ? 'Modelo IA' : 'Heurística'}</div>
         </div>
         <div>
-          <div style="color: #888; font-size: 12px; margin-bottom: 8px;">Classificação</div>
-          <div style="font-size: 14px; font-weight: 600; color: #5b9bd5; word-break: break-word; margin-top: 8px;">${escapeHtml(result.aiDetection.label || 'N/A')}</div>
+          <div style="color: #6B7280; font-size: 12px; margin-bottom: 8px;">Classificação</div>
+          <div style="font-size: 14px; font-weight: 600; color: #2560CC; word-break: break-word; margin-top: 8px;">${escapeHtml(result.aiDetection.label || 'N/A')}</div>
         </div>
       </div>
       ${result.aiDetection.noiseScore !== undefined ? `
-        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; padding-top: 12px; border-top: 1px solid #2e2e2e;">
-          <div><span style="color: #888; font-size: 11px;">Ruído Detectado:</span> <span style="color: #5b9bd5; font-weight: 600;">${Math.round((result.aiDetection.noiseScore || 0) * 100)}%</span></div>
-          <div><span style="color: #888; font-size: 11px;">Artefatos:</span> <span style="color: #5b9bd5; font-weight: 600;">${Math.round((result.aiDetection.artifactScore || 0) * 100)}%</span></div>
+        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; padding-top: 12px; border-top: 1px solid #E3E6EB;">
+          <div><span style="color: #6B7280; font-size: 11px;">Ruído Detectado:</span> <span style="color: #2560CC; font-weight: 600;">${Math.round((result.aiDetection.noiseScore || 0) * 100)}%</span></div>
+          <div><span style="color: #6B7280; font-size: 11px;">Artefatos:</span> <span style="color: #2560CC; font-weight: 600;">${Math.round((result.aiDetection.artifactScore || 0) * 100)}%</span></div>
         </div>
       ` : ''}
-      ${result.heatmapBase64 ? `<div style="margin-top: 16px;"><div style="font-size: 12px; color: #888; margin-bottom: 8px;">Mapa de Calor (Anomalias):</div><img src="data:image/png;base64,${result.heatmapBase64}" style="width: 100%; max-width: 500px; border-radius: 4px; border: 1px solid #333;"><div style="color: #666; font-size: 11px; margin-top: 8px;">🔵 Azul = Autêntico | 🔴 Vermelho = Possível IA</div></div>` : ""}
+      ${result.heatmapBase64 ? `<div style="margin-top: 16px;"><div style="font-size: 12px; color: #6B7280; margin-bottom: 8px;">Mapa de Calor (Anomalias):</div><img src="data:image/png;base64,${result.heatmapBase64}" style="width: 100%; max-width: 500px; border-radius: 4px; border: 1px solid #E3E6EB;"><div style="color: #6B7280; font-size: 11px; margin-top: 8px;">🔵 Azul = Autêntico | 🔴 Vermelho = Possível IA</div></div>` : ""}
     </div>`;
   }
   
@@ -1634,14 +1473,14 @@ function formatResultHtml(result) {
   let videoFramesSection = "";
   if (result.frameAnalyses && result.frameAnalyses.length > 0) {
     const avgAI = (result.frameAnalyses.reduce((a, f) => a + f.aiProbability, 0) / result.frameAnalyses.length * 100).toFixed(0);
-    videoFramesSection = `<div style="background: rgba(30,136,229,0.06); border: 1px solid #1e88e5; border-radius: 2px; padding: 20px; margin-bottom: 20px;">
-      <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; color: #1e88e5; text-transform: uppercase; font-weight: 700; margin-bottom: 16px;">🎬 Análise de Frames - Técnicas Ativadas</div>
-      <div style="margin-bottom: 16px; padding: 8px; background: #1a1a1a; border-radius: 4px; color: #aaa; font-size: 12px;">IA Detectada (Média): <span style="color: #5b9bd5; font-weight: 700;">${avgAI}%</span></div>
+    videoFramesSection = `<div style="background: #EEF3FC; border: 1px solid #CCDAF3; border-radius: 18px; padding: 20px; margin-bottom: 20px;">
+      <div style="font-size: 12px; color: #2560CC; text-transform: uppercase; font-weight: 700; margin-bottom: 16px;">🎬 Análise de Frames - Técnicas Ativadas</div>
+      <div style="margin-bottom: 16px; padding: 8px; background: #F4F6F9; border-radius: 4px; color: #4A5260; font-size: 12px;">IA Detectada (Média): <span style="color: #2560CC; font-weight: 700;">${avgAI}%</span></div>
       <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr)); gap: 16px;">`;
     
     result.frameAnalyses.forEach((frame, idx) => {
       const frameAiPct = Math.round((frame.aiProbability || 0) * 100);
-      const frameColor = frameAiPct > 70 ? "#e53935" : frameAiPct > 40 ? "#fb8c00" : "#43a047";
+      const frameColor = frameAiPct > 70 ? "#C62828" : frameAiPct > 40 ? "#B45F06" : "#2E8B57";
       const frameLabel = frameAiPct > 70 ? "CERTEZA IA" : frameAiPct > 40 ? "SUSPEITO" : "PARECE REAL";
       
       // 🔴 Separar técnicas ativadas (IA) das limpas (OK)
@@ -1657,16 +1496,16 @@ function formatResultHtml(result) {
             const desc = escapeHtml(techDescription(name));
             return `<div style="background: rgba(229,57,53,0.08); border: 1px solid rgba(229,57,53,0.3); border-radius: 6px; padding: 10px 12px;">
               <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
-                <span style="color: #ddd; font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 5px;">
+                <span style="color: #1F242C; font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 5px;">
                   ${escapeHtml(cleanName)}
                   <span class="tech-info" tabindex="0" data-tip="${desc}">!</span>
                 </span>
-                <span style="color: #e53935; font-size: 11px; font-weight: 700;">⚠ IA</span>
+                <span style="color: #C62828; font-size: 11px; font-weight: 700;">⚠ IA</span>
               </div>
-              <div style="color: #ff8a80; font-size: 16px; font-weight: 700; margin-top: 4px; font-family: 'Barlow Condensed', sans-serif;">${tech.value}</div>
+              <div style="color: #C62828; font-size: 16px; font-weight: 700; margin-top: 4px; font-family: 'Barlow Condensed', sans-serif;">${tech.value}</div>
             </div>`;
           }).join('') 
-        : `<div style="grid-column: 1/-1; color: #43a047; font-size: 14px; padding: 12px; text-align: center; background: rgba(67,160,71,0.08); border-radius: 6px;">✓ Nenhuma anomalia de IA detectada</div>`;
+        : `<div style="grid-column: 1/-1; color: #2E8B57; font-size: 14px; padding: 12px; text-align: center; background: rgba(67,160,71,0.08); border-radius: 6px;">✓ Nenhuma anomalia de IA detectada</div>`;
       
       // Cards de técnicas limpas (compactos)
       const cleanCards = cleanTechniques.map(([name, tech]) => {
@@ -1674,25 +1513,25 @@ function formatResultHtml(result) {
         const desc = escapeHtml(techDescription(name));
         return `<div style="background: rgba(67,160,71,0.05); border: 1px solid rgba(67,160,71,0.2); border-radius: 6px; padding: 8px 10px;">
           <div style="display: flex; align-items: center; justify-content: space-between; gap: 6px;">
-            <span style="color: #999; font-size: 12px; display: flex; align-items: center; gap: 5px;">
+            <span style="color: #5B6370; font-size: 12px; display: flex; align-items: center; gap: 5px;">
               ${escapeHtml(cleanName)}
               <span class="tech-info" tabindex="0" data-tip="${desc}">!</span>
             </span>
-            <span style="color: #43a047; font-size: 11px;">✓</span>
+            <span style="color: #2E8B57; font-size: 11px;">✓</span>
           </div>
-          <div style="color: #6a9; font-size: 13px; font-weight: 600; margin-top: 2px; font-family: 'Barlow Condensed', sans-serif;">${tech.value}</div>
+          <div style="color: #2E8B57; font-size: 13px; font-weight: 600; margin-top: 2px; font-family: 'Barlow Condensed', sans-serif;">${tech.value}</div>
         </div>`;
       }).join('');
       
-      videoFramesSection += `<div style="padding: 14px; background: #1a1a1a; border: 2px solid ${frameColor}40; border-radius: 8px;">
+      videoFramesSection += `<div style="padding: 14px; background: #F4F6F9; border: 2px solid ${frameColor}40; border-radius: 8px;">
         <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
-          <div style="font-weight: 600; color: #fff; font-size: 17px;">📹 Frame ${frame.frameNum}</div>
+          <div style="font-weight: 600; color: #14171C; font-size: 17px;">📹 Frame ${frame.frameNum}</div>
           <div style="background: ${frameColor}20; color: ${frameColor}; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 12px; text-transform: uppercase; letter-spacing: 0.05em;">${frameLabel}</div>
         </div>
         
         <!-- Frame com overlay de bolinhas marcando rastros de IA -->
         <div style="position: relative; width: 100%; margin-bottom: 12px; background: #000; border-radius: 4px; box-sizing: border-box; line-height: 0;">
-          <img src="data:image/jpeg;base64,${result.frameBase64s[idx]}" style="width: 100%; height: auto; border-radius: 4px; display: block; box-shadow: 0 4px 8px rgba(0,0,0,0.5); border: 1px solid #333;">
+          <img src="data:image/jpeg;base64,${result.frameBase64s[idx]}" style="width: 100%; height: auto; border-radius: 4px; display: block; box-shadow: 0 4px 8px rgba(0,0,0,0.5); border: 1px solid #E3E6EB;">
           <div style="position: absolute; top: 0; left: 0; right: 0; bottom: 0; border-radius: 4px; pointer-events: none;">
             ${(frame.aiTraceDots && frame.aiTraceDots.length > 0 && frameAiPct > 40) ? frame.aiTraceDots.map(dot => {
               const dotColor = dot.type === 'bloom' ? '#FFD700' : dot.type === 'edge' ? '#FF5252' : '#40C4FF';
@@ -1704,28 +1543,28 @@ function formatResultHtml(result) {
         
         ${(frame.aiTraceDots && frame.aiTraceDots.length > 0 && frameAiPct > 40) ? `
         <!-- Legenda das bolinhas -->
-        <div style="display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 12px; padding: 8px 12px; background: #0f0f0f; border-radius: 6px; font-size: 11px; color: #aaa;">
+        <div style="display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 12px; padding: 8px 12px; background: #F4F6F9; border-radius: 6px; font-size: 11px; color: #4A5260;">
           <span style="display: flex; align-items: center; gap: 5px;"><span style="width: 10px; height: 10px; border-radius: 50%; border: 2px solid #FFD700; background: #FFD70033; display: inline-block;"></span> Bloom/Halo</span>
           <span style="display: flex; align-items: center; gap: 5px;"><span style="width: 10px; height: 10px; border-radius: 50%; border: 2px solid #FF5252; background: #FF525233; display: inline-block;"></span> Bordas artificiais</span>
           <span style="display: flex; align-items: center; gap: 5px;"><span style="width: 10px; height: 10px; border-radius: 50%; border: 2px solid #40C4FF; background: #40C4FF33; display: inline-block;"></span> Luz inconsistente</span>
-          <span style="margin-left: auto; color: #666;">${frame.aiTraceDots.length} rastros marcados</span>
+          <span style="margin-left: auto; color: #6B7280;">${frame.aiTraceDots.length} rastros marcados</span>
         </div>
         ` : ''}
         
         <!-- Barra de IA Detectada -->
-        <div style="padding: 12px 14px; background: #0a0a0a; border-radius: 6px; margin-bottom: 14px; border-left: 4px solid ${frameColor}; display: flex; align-items: center; justify-content: space-between;">
-          <span style="color: #aaa; font-size: 14px; font-weight: 600;">IA Detectada</span>
-          <span style="color: ${frameColor}; font-size: 32px; font-weight: 700; font-family: 'Barlow Condensed', sans-serif; line-height: 1;">${frameAiPct}%</span>
+        <div style="padding: 12px 14px; background: #F4F6F9; border-radius: 6px; margin-bottom: 14px; border-left: 4px solid ${frameColor}; display: flex; align-items: center; justify-content: space-between;">
+          <span style="color: #4A5260; font-size: 14px; font-weight: 600;">IA Detectada</span>
+          <span style="color: ${frameColor}; font-size: 32px; font-weight: 700; line-height: 1;">${frameAiPct}%</span>
         </div>
         
         <!-- Técnicas que acusaram IA -->
-        <div style="font-size: 12px; color: #e53935; margin-bottom: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;">⚠ Indicadores de IA (${activeTechniques.length})</div>
+        <div style="font-size: 12px; color: #C62828; margin-bottom: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;">⚠ Indicadores de IA (${activeTechniques.length})</div>
         <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-bottom: 16px;">
           ${activeCards}
         </div>
         
         <!-- Técnicas limpas (verificações OK) -->
-        <div style="font-size: 12px; color: #43a047; margin-bottom: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;">✓ Verificações OK (${cleanTechniques.length})</div>
+        <div style="font-size: 12px; color: #2E8B57; margin-bottom: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;">✓ Verificações OK (${cleanTechniques.length})</div>
         <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 6px;">
           ${cleanCards}
         </div>
@@ -1734,11 +1573,11 @@ function formatResultHtml(result) {
     videoFramesSection += `</div></div>`;
   } else if (result.inputType === "video" && !result.ffmpegAvailable) {
     // 🔴 [NOVO] Mensagem quando ffmpeg não está disponível
-    videoFramesSection = `<div style="background: rgba(255,152,0,0.06); border: 1px solid #ff9800; border-radius: 2px; padding: 20px; margin-bottom: 20px;">
-      <div style="font-family: 'Barlow Condensed', sans-serif; font-size: 12px; color: #ff9800; text-transform: uppercase; font-weight: 700; margin-bottom: 12px;">⚠️ Análise de Frames Indisponível</div>
-      <div style="color: #aaa; font-size: 13px; line-height: 1.5;">
+    videoFramesSection = `<div style="background: #FDF5EA; border: 1px solid #F1DDBE; border-radius: 18px; padding: 20px; margin-bottom: 20px;">
+      <div style="font-size: 12px; color: #B45F06; text-transform: uppercase; font-weight: 700; margin-bottom: 12px;">⚠️ Análise de Frames Indisponível</div>
+      <div style="color: #4A5260; font-size: 13px; line-height: 1.5;">
         <p>FFmpeg não está instalado. Para analisar frames de vídeos, instale:</p>
-        <div style="background: #1a1a1a; padding: 10px; border-radius: 4px; font-family: monospace; margin: 8px 0; font-size: 12px; color: #5b9bd5;">
+        <div style="background: #F4F6F9; padding: 10px; border-radius: 4px; font-family: monospace; margin: 8px 0; font-size: 12px; color: #2560CC;">
           npm install ffmpeg-static
         </div>
         <p style="margin-top: 12px;">Análise factual e de IA por metadata foi realizada. Para análise completa com extração de frames, instale ffmpeg-static.</p>
@@ -1885,72 +1724,60 @@ function renderAuthPage({ mode = "login", error = "", email = "", name = "", not
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>${pageTitle} · Verifacts</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2212%22%20fill%3D%22%230a0a0a%22%2F%3E%3Ctext%20x%3D%2232%22%20y%3D%2244%22%20font-family%3D%22Arial%2Csans-serif%22%20font-size%3D%2234%22%20font-weight%3D%22700%22%20text-anchor%3D%22middle%22%3E%3Ctspan%20fill%3D%22%23f0f0f0%22%3EV%3C%2Ftspan%3E%3Ctspan%20fill%3D%22%23d0312d%22%3EF%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fsvg%3E">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Barlow:wght@300;400&display=swap" rel="stylesheet">
+  <title>${pageTitle} · Ecoa Saúde</title>
+  <link rel="icon" href="${ECOA_FAVICON}">
+  ${ECOA_FONTS}
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background: #0a0a0a; color: #ccc;
-      font-family: 'Barlow', sans-serif; font-weight: 300;
+      background: #FFFFFF; color: #1F242C;
+      font-family: 'Figtree', system-ui, sans-serif;
       min-height: 100vh; display: flex; align-items: center; justify-content: center;
-      padding: 20px;
+      padding: 20px; -webkit-font-smoothing: antialiased;
     }
-    .auth-card {
-      width: 100%; max-width: 400px;
-      background: #111; border: 1px solid #2e2e2e; border-top: 2px solid #5b9bd5;
-      border-radius: 2px; padding: 40px 36px;
-    }
-    .auth-logo {
-      font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 30px;
-      letter-spacing: 0.04em; text-transform: uppercase; color: #f0f0f0;
-      text-align: center; margin-bottom: 6px;
-    }
-    .auth-logo span { color: #d0312d; }
-    .auth-sub { text-align: center; font-size: 13px; color: #555; margin-bottom: 30px; }
-    .f { margin-bottom: 16px; }
-    .f label {
-      display: block; font-family: 'Barlow Condensed', sans-serif; font-size: 12px;
-      font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase;
-      color: #555; margin-bottom: 6px;
-    }
+    .auth-card { width: 100%; max-width: 400px; }
+    .auth-brand { display: flex; flex-direction: column; align-items: center; gap: 12px; margin-bottom: 8px; }
+    .auth-logo { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; line-height: 1; }
+    .auth-logo .wm-a { color: #D8282E; } .auth-logo .wm-b { color: #2560CC; }
+    .auth-sub { text-align: center; font-size: 15px; color: #4A5260; margin-bottom: 28px; }
+    .auth-box { background: #FFFFFF; border: 1px solid #E6E8EC; border-radius: 22px; padding: 28px 26px; box-shadow: 0 1px 2px rgba(16,24,40,.04), 0 12px 32px rgba(16,24,40,.07); }
+    .f { margin-bottom: 14px; }
+    .f label { display: block; font-size: 13.5px; font-weight: 600; color: #4A5260; margin-bottom: 6px; }
     .f input {
-      width: 100%; background: #181818; border: 1px solid #2e2e2e; border-radius: 2px;
-      color: #f0f0f0; font-family: 'Barlow', sans-serif; font-size: 16px;
-      padding: 12px 14px; outline: none; transition: border-color 0.15s;
+      width: 100%; background: #F3F5F8; border: 1px solid #E3E6EB; border-radius: 14px;
+      color: #0F1217; font-family: inherit; font-size: 16px;
+      padding: 12px 14px; outline: none; transition: border-color .15s, box-shadow .15s;
     }
-    .f input:focus { border-color: #5b9bd5; }
+    .f input::placeholder { color: #6B7280; }
+    .f input:focus { border-color: #2560CC; box-shadow: 0 0 0 3px rgba(37,96,204,.16); }
     .auth-btn {
-      width: 100%; margin-top: 8px; padding: 14px;
-      background: #f0f0f0; color: #0a0a0a; border: none; border-radius: 2px;
-      font-family: 'Barlow Condensed', sans-serif; font-size: 15px; font-weight: 700;
-      letter-spacing: 0.12em; text-transform: uppercase; cursor: pointer;
-      transition: background 0.15s;
+      width: 100%; margin-top: 8px; padding: 13px;
+      background: #2560CC; color: #fff; border: none; border-radius: 999px;
+      font-family: inherit; font-size: 16px; font-weight: 700; cursor: pointer;
+      transition: background .15s;
     }
-    .auth-btn:hover { background: #d8d8d8; }
+    .auth-btn:hover { background: #1E4FB0; }
+    .auth-btn:focus-visible, a:focus-visible { outline: 2px solid #2560CC; outline-offset: 2px; }
     .auth-error {
-      background: rgba(229,57,53,0.1); border: 1px solid rgba(229,57,53,0.4);
-      color: #ff8a80; font-size: 13px; padding: 10px 14px; border-radius: 2px;
-      margin-bottom: 18px; line-height: 1.4;
+      background: rgba(239,83,87,.1); border: 1px solid rgba(239,83,87,.35);
+      color: #B71C1C; font-size: 14px; padding: 10px 14px; border-radius: 12px;
+      margin-bottom: 16px; line-height: 1.45;
     }
-    .auth-switch { text-align: center; margin-top: 22px; font-size: 14px; color: #555; }
-    .auth-switch a { color: #5b9bd5; text-decoration: none; }
-    .auth-switch a:hover { color: #f0f0f0; }
-    .auth-plans {
-      margin-top: 24px; padding-top: 18px; border-top: 1px solid #222;
-      font-size: 12px; color: #555; line-height: 1.8; text-align: center;
-    }
-    .auth-plans b { color: #888; }
+    .auth-switch { text-align: center; margin-top: 20px; font-size: 14.5px; color: #6B7280; }
+    .auth-switch a { color: #2560CC; text-decoration: none; font-weight: 600; }
+    .auth-switch a:hover { color: #0F1217; }
+    .auth-plans { margin-top: 20px; font-size: 13px; color: #6B7280; line-height: 1.7; text-align: center; }
+    .auth-plans b { color: #4A5260; }
+    .auth-tag { text-align: center; font-size: 13px; color: #6B7280; margin-top: 26px; }
   </style>
 </head>
 <body>
   <div class="auth-card">
-    <div class="auth-logo">Veri<span>facts</span></div>
-    <div class="auth-sub">Verificação de fatos + Detecção de IA</div>
+    <div class="auth-brand">${ecoaMark(64, "au")}<div class="auth-logo">${ECOA_WORDMARK}</div></div>
+    <div class="auth-sub">Recebeu uma informação e ficou na dúvida? A gente checa.</div>
+    <div class="auth-box">
     ${error ? `<div class="auth-error">${escapeHtml(error)}</div>` : ""}
-    ${notice ? `<div class="auth-error" style="background:rgba(67,160,71,0.1); border-color:rgba(67,160,71,0.4); color:#81c784;">${escapeHtml(notice)}</div>` : ""}
+    ${notice ? `<div class="auth-error" style="background:rgba(77,184,131,0.1); border-color:rgba(77,184,131,0.35); color:#1E7A4C;">${escapeHtml(notice)}</div>` : ""}
     <form method="post" action="${isRedefinir ? "/redefinir" : isEsqueci ? "/esqueci" : isLogin ? "/login" : "/register"}">
       ${mode === "register" ? `
       <div class="f">
@@ -1976,7 +1803,7 @@ function renderAuthPage({ mode = "login", error = "", email = "", name = "", not
         <label>Senha</label>
         <input type="password" name="password" required minlength="6" maxlength="72" placeholder="${isLogin ? "Sua senha" : "Mínimo 6 caracteres"}">
       </div>`}
-      ${isLogin ? `<div style="text-align:right; margin:-6px 0 14px;"><a href="/esqueci" style="font-size:13px; color:#5b9bd5;">Esqueceu a senha?</a></div>` : ""}
+      ${isLogin ? `<div style="text-align:right; margin:-6px 0 14px;"><a href="/esqueci" style="font-size:13.5px; color:#2560CC;">Esqueceu a senha?</a></div>` : ""}
       <button class="auth-btn" type="submit">${isRedefinir ? "Salvar nova senha" : isEsqueci ? "Enviar link de recuperação" : isLogin ? "Entrar" : "Criar conta grátis"}</button>
     </form>
     <div class="auth-switch">
@@ -1984,91 +1811,88 @@ function renderAuthPage({ mode = "login", error = "", email = "", name = "", not
         : isEsqueci || isRedefinir ? `Lembrou a senha? <a href="/login">Entrar</a>`
         : `Já tem conta? <a href="/login">Entrar</a>`}
     </div>
+    </div>
     ${mode === "register" ? `
     <div class="auth-plans">
-      Sua conta inicia no plano <b>Grátis</b>: 2 verificações para testar, sem cartão.<br>
-      Planos pagos: Starter R$ 129,90 · Profissional R$ 339,90 · Institucional sob consulta
+      A conta é gratuita e você pode fazer <b>quantas verificações quiser</b>, sem cartão.
     </div>` : ""}
+    <div class="auth-tag">Ouvir, acolher, transformar</div>
   </div>
 </body>
 </html>`;
 }
 
 // ══════════════════════════════════════════════════════════
-// ⚙️ PÁGINAS: CONTA (configurações) e PLANOS (mudança de plano)
+// ⚙️ PÁGINA: CONTA (configurações)
 // ══════════════════════════════════════════════════════════
 function renderSubPage(title, content, user) {
   const info = usageInfo(user);
-  const usageText = info.unlimited ? `${info.used} verificações` : `${info.used} / ${info.limit}`;
   return `<!doctype html>
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>${escapeHtml(title)} · Verifacts</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2212%22%20fill%3D%22%230a0a0a%22%2F%3E%3Ctext%20x%3D%2232%22%20y%3D%2244%22%20font-family%3D%22Arial%2Csans-serif%22%20font-size%3D%2234%22%20font-weight%3D%22700%22%20text-anchor%3D%22middle%22%3E%3Ctspan%20fill%3D%22%23f0f0f0%22%3EV%3C%2Ftspan%3E%3Ctspan%20fill%3D%22%23d0312d%22%3EF%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fsvg%3E">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Barlow:wght@300;400&display=swap" rel="stylesheet">
+  <title>${escapeHtml(title)} · Ecoa Saúde</title>
+  <link rel="icon" href="${ECOA_FAVICON}">
+  ${ECOA_FONTS}
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background:#0a0a0a; color:#ccc; font-family:'Barlow',sans-serif; font-weight:300; font-size:16px; line-height:1.6; min-height:100vh; }
-    a { color:#888; text-decoration:none; } a:hover { color:#f0f0f0; }
-    header { border-bottom:1px solid #222; padding:0 32px; display:flex; align-items:center; justify-content:space-between; height:62px; }
-    .logo { font-family:'Barlow Condensed',sans-serif; font-weight:700; font-size:26px; letter-spacing:0.04em; text-transform:uppercase; color:#f0f0f0; }
-    .logo span { color:#d0312d; }
-    .nav { display:flex; align-items:center; gap:20px; }
-    .nav a { font-family:'Barlow Condensed',sans-serif; font-size:13px; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:#555; transition:color 0.15s; }
-    .nav a:hover, .nav a.active { color:#f0f0f0; }
-    .nav .sair { border:1px solid #2e2e2e; padding:7px 14px; border-radius:2px; }
-    .nav .sair:hover { color:#e53935; border-color:#e53935; }
+    body { background:#FFFFFF; color:#1F242C; font-family:'Figtree',system-ui,sans-serif; font-size:16px; line-height:1.6; min-height:100vh; -webkit-font-smoothing:antialiased; }
+    a { color:#4A5260; text-decoration:none; } a:hover { color:#0F1217; }
+    header { border-bottom:1px solid #E6E8EC; padding:0 28px; display:flex; align-items:center; justify-content:space-between; height:64px; background:#F6F7F9; }
+    .logo { display:flex; align-items:center; gap:10px; font-weight:800; font-size:20px; letter-spacing:-0.02em; line-height:1; }
+    .logo .wm-a { color:#D8282E; } .logo .wm-b { color:#2560CC; }
+    .nav { display:flex; align-items:center; gap:6px; }
+    .nav a { font-size:14.5px; font-weight:600; color:#4A5260; padding:7px 12px; border-radius:999px; transition:background .15s, color .15s; }
+    .nav a:hover { color:#0F1217; background:#EEF1F5; }
+    .nav a.active { color:#0F1217; background:#F3F5F8; }
+    .nav .sair:hover { color:#C62828; }
     .wrap { max-width:820px; margin:0 auto; padding:40px 24px 80px; }
-    .page-title { font-family:'Barlow Condensed',sans-serif; font-size:30px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; color:#f0f0f0; margin-bottom:6px; }
-    .page-sub { font-size:14px; color:#555; margin-bottom:34px; }
-    .card { background:#111; border:1px solid #222; border-radius:2px; padding:28px; margin-bottom:22px; }
-    .card-title { font-family:'Barlow Condensed',sans-serif; font-size:14px; font-weight:700; letter-spacing:0.14em; text-transform:uppercase; color:#5b9bd5; margin-bottom:20px; padding-bottom:10px; border-bottom:1px solid #222; }
-    .f { margin-bottom:16px; }
-    .f label { display:block; font-family:'Barlow Condensed',sans-serif; font-size:12px; font-weight:600; letter-spacing:0.14em; text-transform:uppercase; color:#555; margin-bottom:6px; }
-    .f input { width:100%; background:#181818; border:1px solid #2e2e2e; border-radius:2px; color:#f0f0f0; font-family:'Barlow',sans-serif; font-size:16px; padding:11px 13px; outline:none; transition:border-color 0.15s; }
-    .f input:focus { border-color:#5b9bd5; }
-    .f input[disabled] { color:#666; cursor:not-allowed; }
-    .btn { padding:12px 26px; background:#f0f0f0; color:#0a0a0a; border:none; border-radius:2px; font-family:'Barlow Condensed',sans-serif; font-size:14px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; cursor:pointer; transition:background 0.15s; }
-    .btn:hover { background:#d8d8d8; }
-    .msg-ok { background:rgba(67,160,71,0.1); border:1px solid rgba(67,160,71,0.4); color:#81c784; font-size:13px; padding:10px 14px; border-radius:2px; margin-bottom:20px; }
-    .msg-err { background:rgba(229,57,53,0.1); border:1px solid rgba(229,57,53,0.4); color:#ff8a80; font-size:13px; padding:10px 14px; border-radius:2px; margin-bottom:20px; }
-    .usage-bar { height:6px; background:#222; border-radius:3px; overflow:hidden; margin-top:10px; }
+    .page-title { font-size:30px; font-weight:800; letter-spacing:-0.015em; color:#0F1217; margin-bottom:6px; line-height:1.2; }
+    .page-sub { font-size:15px; color:#4A5260; margin-bottom:32px; }
+    .card { background:#F6F7F9; border:1px solid #E6E8EC; border-radius:20px; padding:26px; margin-bottom:20px; }
+    .card-title { font-size:17px; font-weight:700; color:#0F1217; margin-bottom:18px; }
+    .f { margin-bottom:14px; }
+    .f label { display:block; font-size:13.5px; font-weight:600; color:#4A5260; margin-bottom:6px; }
+    .f input { width:100%; background:#F3F5F8; border:1px solid #E3E6EB; border-radius:14px; color:#0F1217; font-family:inherit; font-size:16px; padding:11px 14px; outline:none; transition:border-color .15s, box-shadow .15s; }
+    .f input:focus { border-color:#2560CC; box-shadow:0 0 0 3px rgba(37,96,204,.16); }
+    .f input[disabled] { color:#6B7280; cursor:not-allowed; }
+    .btn { padding:11px 24px; background:#2560CC; color:#fff; border:none; border-radius:999px; font-family:inherit; font-size:15px; font-weight:700; cursor:pointer; transition:background .15s; }
+    .btn:hover { background:#1E4FB0; }
+    :focus-visible { outline:2px solid #2560CC; outline-offset:2px; }
+    .msg-ok { background:rgba(77,184,131,.1); border:1px solid rgba(77,184,131,.35); color:#1E7A4C; font-size:14px; padding:10px 14px; border-radius:12px; margin-bottom:20px; }
+    .msg-err { background:rgba(239,83,87,.1); border:1px solid rgba(239,83,87,.35); color:#B71C1C; font-size:14px; padding:10px 14px; border-radius:12px; margin-bottom:20px; }
+    .usage-bar { height:6px; background:#E6E8EC; border-radius:3px; overflow:hidden; margin-top:10px; }
     .usage-fill { height:100%; border-radius:3px; }
     .plans-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:16px; }
-    .plan-card { background:#111; border:1px solid #2e2e2e; border-radius:4px; padding:26px 22px; display:flex; flex-direction:column; transition:border-color 0.15s; position:relative; }
-    .plan-card:hover { border-color:#555; }
-    .plan-card.current { border-color:#5b9bd5; }
-    .plan-badge { position:absolute; top:-11px; left:50%; transform:translateX(-50%); background:#5b9bd5; color:#0a0a0a; font-family:'Barlow Condensed',sans-serif; font-size:11px; font-weight:700; letter-spacing:0.1em; text-transform:uppercase; padding:3px 12px; border-radius:10px; }
-    .plan-name { font-family:'Barlow Condensed',sans-serif; font-size:20px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; color:#f0f0f0; margin-bottom:4px; }
-    .plan-price { font-family:'Barlow Condensed',sans-serif; font-size:28px; font-weight:700; color:#5b9bd5; margin-bottom:14px; }
-    .plan-feats { list-style:none; font-size:14px; color:#888; line-height:2; margin-bottom:20px; flex:1; }
-    .plan-feats li::before { content:'✓ '; color:#43a047; }
-    .plan-btn { width:100%; padding:11px; border-radius:2px; font-family:'Barlow Condensed',sans-serif; font-size:13px; font-weight:700; letter-spacing:0.1em; text-transform:uppercase; cursor:pointer; border:1px solid #2e2e2e; background:transparent; color:#ccc; transition:all 0.15s; text-align:center; display:block; }
-    .plan-btn:hover { background:#f0f0f0; color:#0a0a0a; border-color:#f0f0f0; }
-    .plan-btn[disabled] { opacity:0.35; cursor:default; }
-    .plan-btn[disabled]:hover { background:transparent; color:#ccc; border-color:#2e2e2e; }
-    footer { border-top:1px solid #222; padding:18px 32px; text-align:center; font-size:13px; color:#555; }
-    /* 📱 [FIX MOBILE] */
+    .plan-card { background:#F6F7F9; border:1px solid #E6E8EC; border-radius:20px; padding:26px 22px; display:flex; flex-direction:column; transition:border-color .15s; position:relative; }
+    .plan-card:hover { border-color:#D5D9E0; }
+    .plan-card.current { border-color:#2560CC; }
+    .plan-badge { position:absolute; top:-11px; left:50%; transform:translateX(-50%); background:#2560CC; color:#fff; font-size:12px; font-weight:700; padding:3px 12px; border-radius:999px; white-space:nowrap; }
+    .plan-name { font-size:20px; font-weight:800; color:#0F1217; margin-bottom:4px; }
+    .plan-price { font-size:28px; font-weight:800; color:#2560CC; margin-bottom:14px; }
+    .plan-feats { list-style:none; font-size:14.5px; color:#4A5260; line-height:2; margin-bottom:20px; flex:1; }
+    .plan-feats li::before { content:'✓ '; color:#2E8B57; }
+    .plan-btn { width:100%; padding:11px; border-radius:999px; font-family:inherit; font-size:14.5px; font-weight:700; cursor:pointer; border:1px solid #D5D9E0; background:transparent; color:#1F242C; transition:all .15s; text-align:center; display:block; }
+    .plan-btn:hover { background:#0F1217; color:#FFFFFF; border-color:#0F1217; }
+    .plan-btn[disabled] { opacity:.35; cursor:default; }
+    .plan-btn[disabled]:hover { background:transparent; color:#1F242C; border-color:#D5D9E0; }
+    footer { border-top:1px solid #E6E8EC; padding:18px 28px; text-align:center; font-size:13px; color:#6B7280; }
     @media (max-width: 700px) {
-      header { height:auto; min-height:62px; flex-wrap:wrap; padding:10px 16px; gap:8px 12px; }
-      .nav { flex-wrap:wrap; gap:10px 14px; }
+      header { height:auto; min-height:60px; flex-wrap:wrap; padding:10px 14px; gap:8px 12px; }
+      .nav { flex-wrap:wrap; gap:4px; }
       .wrap { padding:24px 14px 60px; }
-      .card { padding:18px 14px; }
+      .card { padding:18px 16px; }
       table { font-size:12px !important; }
     }
   </style>
 </head>
 <body>
 <header>
-  <div class="logo">Veri<span>facts</span></div>
+  <a class="logo" href="/">${ecoaMark(28, "sp")}${ECOA_WORDMARK}</a>
   <nav class="nav">
     <a href="/">Verificar</a>
-    ${isAdmin(user) ? `<a href="/admin" class="${title==='Admin'?'active':''}" style="color:#FFD700;">👑 Admin</a>` : ""}
-    <a href="/planos" class="${title==='Planos'?'active':''}">Planos</a>
+    ${isAdmin(user) ? `<a href="/admin" class="${title==='Admin'?'active':''}" style="color:#9A7400;">Admin</a>` : ""}
     <a href="/conta" class="${title==='Minha Conta'?'active':''}">Conta</a>
     <a href="/logout" class="sair">Sair</a>
   </nav>
@@ -2076,15 +1900,13 @@ function renderSubPage(title, content, user) {
 <div class="wrap">
 ${content}
 </div>
-<footer>Verifacts · ${escapeHtml(user.name)} · Plano ${escapeHtml(info.planName)} · ${usageText} ${info.lifetime ? "(teste grátis)" : "este mês"}</footer>
+<footer>Ecoa Saúde · ${escapeHtml(user.name)} · ${info.used} ${info.used === 1 ? "verificação" : "verificações"} este mês · ${info.total} no total</footer>
 </body>
 </html>`;
 }
 
 function renderContaPage(user, q = {}) {
   const info = usageInfo(user);
-  const usagePct = info.unlimited ? 0 : Math.min(100, Math.round((info.used / info.limit) * 100));
-  const usageColor = usagePct >= 90 ? "#e53935" : usagePct >= 70 ? "#fb8c00" : "#5b9bd5";
   let msg = "";
   if (q.ok === "perfil") msg = `<div class="msg-ok">✓ Perfil atualizado com sucesso.</div>`;
   if (q.ok === "senha") msg = `<div class="msg-ok">✓ Senha alterada com sucesso.</div>`;
@@ -2096,18 +1918,15 @@ function renderContaPage(user, q = {}) {
   ${msg}
 
   <div class="card">
-    <div class="card-title">Plano e Uso</div>
+    <div class="card-title">Seu uso</div>
     <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:10px;">
       <div>
-        <span style="font-family:'Barlow Condensed',sans-serif; font-size:22px; font-weight:700; color:#f0f0f0;">${escapeHtml(info.planName)}</span>
-        <span style="font-size:13px; color:#555; margin-left:8px;">${escapeHtml(planOf(user).price)}</span>
+        <span style="font-size:22px; font-weight:700; color:#14171C;">${info.used}</span>
+        <span style="font-size:13.5px; color:#6B7280; margin-left:8px;">verificações este mês</span>
       </div>
-      <div style="font-size:14px; color:${usageColor}; font-weight:600;">
-        ${info.unlimited ? `${info.used} verificações este mês (ilimitado)` : info.lifetime ? `${info.used} de ${info.limit} verificações gratuitas usadas` : `${info.used} de ${info.limit} verificações este mês`}
-      </div>
+      <div style="font-size:14px; color:#2560CC; font-weight:600;">${info.total} no total</div>
     </div>
-    ${info.unlimited ? "" : `<div class="usage-bar"><div class="usage-fill" style="width:${usagePct}%; background:${usageColor};"></div></div>`}
-    <div style="margin-top:18px;"><a href="/planos" style="color:#5b9bd5; font-family:'Barlow Condensed',sans-serif; font-size:13px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase;">Ver planos e fazer upgrade →</a></div>
+    <div style="margin-top:14px; font-size:13.5px; color:#6B7280;">Você pode fazer quantas verificações quiser, sem limite.</div>
   </div>
 
   <div class="card">
@@ -2145,1328 +1964,956 @@ function renderContaPage(user, q = {}) {
   </div>
 
   <div class="card" style="border-color:rgba(229,57,53,0.35);">
-    <div class="card-title" style="color:#e53935;">Zona de Perigo</div>
-    <div style="font-size:13px; color:#888; margin-bottom:6px;">Conta criada em ${new Date(user.created_at).toLocaleDateString("pt-BR", { day:"2-digit", month:"long", year:"numeric" })}</div>
-    <p style="font-size:14px; color:#aaa; margin-bottom:18px; line-height:1.5;">Excluir sua conta remove permanentemente seus dados de acesso e histórico de uso. <strong style="color:#ff8a80;">Esta ação não pode ser desfeita.</strong><br><span style="font-size:12px; color:#666;">Mantemos apenas um registro anônimo (hash) para prevenir abuso do período de teste gratuito.</span></p>
+    <div class="card-title" style="color:#C62828;">Zona de Perigo</div>
+    <div style="font-size:13px; color:#6B7280; margin-bottom:6px;">Conta criada em ${new Date(user.created_at).toLocaleDateString("pt-BR", { day:"2-digit", month:"long", year:"numeric" })}</div>
+    <p style="font-size:14px; color:#4A5260; margin-bottom:18px; line-height:1.5;">Excluir sua conta remove permanentemente seus dados de acesso e histórico de uso. <strong style="color:#C62828;">Esta ação não pode ser desfeita.</strong><br><span style="font-size:12px; color:#6B7280;">Mantemos apenas um registro anônimo (hash) para prevenir abuso do período de teste gratuito.</span></p>
     <form method="post" action="/conta/excluir" onsubmit="return confirm('Tem certeza ABSOLUTA? Sua conta e todos os dados serão apagados permanentemente. Esta ação NÃO pode ser desfeita.');">
       <div class="f">
         <label>Digite sua senha para confirmar</label>
         <input type="password" name="password" required placeholder="Sua senha atual">
       </div>
-      <button type="submit" style="padding:12px 26px; background:transparent; color:#e53935; border:1px solid #e53935; border-radius:2px; font-family:'Barlow Condensed',sans-serif; font-size:14px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; cursor:pointer; transition:all 0.15s;" onmouseover="this.style.background='#e53935';this.style.color='#fff'" onmouseout="this.style.background='transparent';this.style.color='#e53935'">Excluir minha conta</button>
+      <button type="submit" style="padding:12px 26px; background:transparent; color:#C62828; border:1px solid #C62828; border-radius:2px; font-size:14px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; cursor:pointer; transition:all 0.15s;" onmouseover="this.style.background='#C62828';this.style.color='#fff'" onmouseout="this.style.background='transparent';this.style.color='#C62828'">Excluir minha conta</button>
     </form>
   </div>`;
   return renderSubPage("Minha Conta", content, user);
 }
 
-function renderPlanosPage(user, q = {}) {
-  const stripeOn = !!CONFIG.STRIPE_SECRET_KEY;
-  let msg = "";
-  if (q.ok === "pagamento") msg = `<div class="msg-ok">✓ Pagamento confirmado! Sua assinatura está ativa e o novo limite já vale.</div>`;
-  else if (q.ok) msg = `<div class="msg-ok">✓ Plano alterado com sucesso! Seu novo limite já está valendo.</div>`;
-  if (q.erro) msg = `<div class="msg-err">${escapeHtml(q.erro)}</div>`;
-
-  function planCard(key, feats) {
-    const p = PLANS[key];
-    const isCurrent = user.plan === key;
-    const isInstitucional = key === "institucional";
-    const isGratis = key === "gratis";
-    let button;
-    if (isCurrent) {
-      button = `<button class="plan-btn" disabled>Plano atual</button>`;
-    } else if (isGratis) {
-      button = `<button class="plan-btn" disabled>Apenas novas contas</button>`;
-    } else if (isInstitucional) {
-      button = `<a class="plan-btn" href="mailto:contato@verifacts.com.br?subject=Plano Institucional Verifacts&body=Olá! Tenho interesse no plano Institucional. Minha conta: ${encodeURIComponent(user.email)}">Falar com vendas</a>`;
-    } else if (stripeOn) {
-      // 💳 Assinatura via Stripe Checkout
-      button = `<form method="post" action="/planos/checkout"><input type="hidden" name="plan" value="${key}"><button class="plan-btn" type="submit" style="background:#635bff; border-color:#635bff; color:#fff;">💳 Assinar ${p.name}</button></form>`;
-    } else {
-      button = `<form method="post" action="/planos/mudar" onsubmit="return confirm('Confirmar mudança para o plano ${p.name}?');"><input type="hidden" name="plan" value="${key}"><button class="plan-btn" type="submit">Mudar para ${p.name}</button></form>`;
-    }
-    return `<div class="plan-card ${isCurrent ? "current" : ""}">
-      ${isCurrent ? `<div class="plan-badge">Seu plano</div>` : ""}
-      <div class="plan-name">${p.name}</div>
-      <div class="plan-price">${p.price}</div>
-      <ul class="plan-feats">${feats.map(f => `<li>${f}</li>`).join("")}</ul>
-      ${button}
-    </div>`;
-  }
-
-  const content = `
-  <div class="page-title">Planos</div>
-  <div class="page-sub">Escolha o plano ideal para o seu volume de verificações.</div>
-  ${msg}
-  <div class="plans-grid">
-    ${planCard("gratis", [
-      "2 verificações para testar",
-      "Texto, link, imagem e vídeo",
-      "Detecção de IA (22 técnicas)",
-      "Sem cartão de crédito",
-      "Plano inicial de toda conta"
-    ])}
-    ${planCard("pessoal", [
-      "30 verificações/mês",
-      "Texto, link, imagem e vídeo",
-      "Detecção de IA (22 técnicas)",
-      "Fact-check + notícias",
-      "Ideal para uso pessoal"
-    ])}
-    ${planCard("starter", [
-      "100 verificações/mês",
-      "Texto, link, imagem e vídeo",
-      "Detecção de IA (22 técnicas)",
-      "Fact-check + notícias",
-      "1 usuário"
-    ])}
-    ${planCard("profissional", [
-      "1.000 verificações/mês",
-      "Tudo do Starter",
-      "Análise de frames de vídeo",
-      "Suporte prioritário",
-      "Ideal para redações"
-    ])}
-    ${planCard("institucional", [
-      "Verificações ilimitadas",
-      "Tudo do Profissional",
-      "SLA e treinamento",
-      "Contrato anual",
-      "Órgãos públicos e empresas"
-    ])}
-  </div>
-  ${(stripeOn && user.stripe_subscription_id) ? `
-  <div class="card" style="margin-top:26px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px;">
-    <div>
-      <div style="font-family:'Barlow Condensed',sans-serif; font-size:15px; font-weight:700; color:#f0f0f0; text-transform:uppercase; letter-spacing:0.06em;">Assinatura ativa</div>
-      <div style="font-size:13px; color:#888; margin-top:4px;">Troque o cartão, veja faturas ou cancele quando quiser.</div>
-    </div>
-    <form method="post" action="/planos/portal">
-      <button class="plan-btn" type="submit" style="width:auto; padding:11px 22px;">Gerenciar assinatura</button>
-    </form>
-  </div>` : ""}
-  <div style="margin-top:26px; font-size:13px; color:#555; text-align:center;">
-    ${stripeOn
-      ? `🔒 Pagamento seguro processado pela <strong style="color:#888;">Stripe</strong>. Cancele quando quiser, sem multa.`
-      : `A cobrança é feita por fatura/contrato. Integração de pagamento automático em breve.`}<br>
-    Dúvidas? <a href="mailto:contato@verifacts.com.br" style="color:#5b9bd5;">contato@verifacts.com.br</a>
-  </div>`;
-  return renderSubPage("Planos", content, user);
+// ══════════════════════════════════════════════════════════
+// 🎨 ECOA SAÚDE — marca (símbolo em SVG + favicon)
+// ══════════════════════════════════════════════════════════
+function ecoaMark(size = 32, idp = "mk", extraClass = "") {
+  const bubbleA = `<circle cx="24" cy="24" r="18"/><path d="M11 35 L6 49 L22 41 Z"/>`;
+  const bubbleB = `<circle cx="40" cy="26" r="18"/><path d="M53 37 L58 51 L42 43 Z"/>`;
+  return `<svg class="ecoa-mark ${extraClass}" width="${size}" height="${Math.round(size * 56 / 64)}" viewBox="0 0 64 56" aria-hidden="true" focusable="false">
+    <defs><clipPath id="${idp}-b">${bubbleB}</clipPath></defs>
+    <g fill="#D8282E">${bubbleA}</g>
+    <g fill="#2560CC">${bubbleB}</g>
+    <g fill="#8C1D3B" clip-path="url(#${idp}-b)">${bubbleA}</g>
+    <circle class="mk-dot" cx="27" cy="25" r="2.3" fill="#fff"/>
+    <circle class="mk-dot" cx="32.5" cy="25" r="2.3" fill="#fff"/>
+    <circle class="mk-dot" cx="38" cy="25" r="2.3" fill="#fff"/>
+  </svg>`;
 }
+const ECOA_FAVICON = "data:image/svg+xml," + encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 56"><defs><clipPath id="b"><circle cx="40" cy="26" r="18"/><path d="M53 37 L58 51 L42 43 Z"/></clipPath></defs><g fill="#D8282E"><circle cx="24" cy="24" r="18"/><path d="M11 35 L6 49 L22 41 Z"/></g><g fill="#2560CC"><circle cx="40" cy="26" r="18"/><path d="M53 37 L58 51 L42 43 Z"/></g><g fill="#8C1D3B" clip-path="url(#b)"><circle cx="24" cy="24" r="18"/><path d="M11 35 L6 49 L22 41 Z"/></g><circle cx="27" cy="25" r="2.3" fill="#fff"/><circle cx="32.5" cy="25" r="2.3" fill="#fff"/><circle cx="38" cy="25" r="2.3" fill="#fff"/></svg>`
+);
+const ECOA_FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&family=Barlow+Condensed:wght@400;600;700&family=Barlow:wght@300;400&display=swap" rel="stylesheet">`;
+const ECOA_WORDMARK = `<span class="wm"><span class="wm-a">Ecoa</span><span class="wm-b">Saúde</span></span>`;
 
 function renderPage(content = "", user = null) {
-  // Barra de usuário no header
-  let userBar = "";
+  const hasResult = !!content;
+
+  // 👤 Bloco da conta (rodapé da barra lateral)
+  let accountBlock = "";
   if (user) {
     const info = usageInfo(user);
-    const usageText = info.unlimited ? `${info.used} verificações` : `${info.used} / ${info.limit}`;
-    const periodText = info.lifetime ? "teste grátis" : "este mês";
-    const usagePct = info.unlimited ? 0 : Math.min(100, Math.round((info.used / info.limit) * 100));
-    const usageColor = usagePct >= 90 ? "#e53935" : usagePct >= 70 ? "#fb8c00" : "#5b9bd5";
-    userBar = `
-      <div style="display:flex; align-items:center; gap:18px;">
-        ${isAdmin(user) ? '<a href="/admin" style="font-family:\'Barlow Condensed\',sans-serif; font-size:13px; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:#FFD700;">👑 Admin</a>' : ''}
-        <a href="/planos" style="font-family:'Barlow Condensed',sans-serif; font-size:13px; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:#555; transition:color 0.15s;" onmouseover="this.style.color='#f0f0f0'" onmouseout="this.style.color='#555'">Planos</a>
-        <a href="/conta" style="font-family:'Barlow Condensed',sans-serif; font-size:13px; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:#555; transition:color 0.15s;" onmouseover="this.style.color='#f0f0f0'" onmouseout="this.style.color='#555'">Conta</a>
-        <div style="text-align:right; border-left:1px solid #222; padding-left:18px;">
-          <div style="font-family:'Barlow Condensed',sans-serif; font-size:14px; font-weight:600; color:#f0f0f0; line-height:1.2;">${escapeHtml(user.name)}</div>
-          <div style="font-size:11px; color:#555;">Plano <span style="color:#5b9bd5; font-weight:600;">${escapeHtml(info.planName)}</span> · <span style="color:${usageColor};">${usageText}</span> ${periodText}</div>
+    const initial = escapeHtml(String(user.name || "?").trim().charAt(0).toUpperCase() || "?");
+    accountBlock = `
+      <div class="account">
+        <div class="account-row">
+          <div class="avatar" aria-hidden="true">${initial}</div>
+          <div class="account-id">
+            <div class="account-name">${escapeHtml(user.name)}</div>
+            <div class="account-plan">${isAdmin(user) ? "Admin" : "Verificações ilimitadas"}</div>
+          </div>
+          <a class="icon-btn" href="/logout" title="Sair" aria-label="Sair">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"/><path d="M10 17l-5-5 5-5"/><path d="M5 12h11"/></svg>
+          </a>
         </div>
-        <a href="/logout" style="font-family:'Barlow Condensed',sans-serif; font-size:12px; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:#555; border:1px solid #2e2e2e; padding:7px 14px; border-radius:2px; transition:all 0.15s;" onmouseover="this.style.color='#e53935';this.style.borderColor='#e53935'" onmouseout="this.style.color='#555';this.style.borderColor='#2e2e2e'">Sair</a>
+        <div class="usage">
+          <div class="usage-text"><span style="color:var(--accent-blue);">${info.used} ${info.used === 1 ? "verificação" : "verificações"}</span> este mês</div>
+        </div>
+        <nav class="account-links">
+          ${isAdmin(user) ? `<a href="/admin" class="is-admin">Admin</a>` : ""}
+          <a href="/conta">Conta</a>
+        </nav>
       </div>`;
   }
+
+  // 📜 Histórico
+  const historyHtml = (() => {
+    const empty = `<div class="sidebar-empty">Suas verificações aparecem aqui.</div>`;
+    if (!user) return empty;
+    const items = getHistory(user.id);
+    if (!items.length) return empty;
+    const V_COLORS = { provavelmente_falso: "var(--c-red)", suspeito: "var(--c-amber)", nao_verificado: "var(--c-blue)", provavelmente_verdadeiro: "var(--c-green)" };
+    return `<div class="sidebar-items">` + items.map(h => {
+      const label = h.text.length > 60 ? h.text.slice(0, 60) + "…" : h.text;
+      const dot = h.verdict && V_COLORS[h.verdict]
+        ? `<span class="h-dot" style="background:${V_COLORS[h.verdict]};"></span>` : `<span class="h-dot h-dot-empty"></span>`;
+      const btn = h.verdict
+        ? `<button class="sidebar-item-btn" title="${escapeHtml(h.text)}" onclick="location.href='/historico/ver/${h.id}'">${dot}<span class="h-label">${escapeHtml(label)}</span></button>`
+        : `<button class="sidebar-item-btn" title="${escapeHtml(h.text)}" data-text="${escapeHtml(h.text)}" onclick="historyUse(this)">${dot}<span class="h-label">${escapeHtml(label)}</span></button>`;
+      return `<div class="sidebar-item" data-hid="${h.id}">
+        ${btn}
+        <button class="sidebar-item-del" title="Remover" aria-label="Remover do histórico" onclick="historyDel(${h.id}, this)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>`;
+    }).join("") + `</div>`;
+  })();
+
   return `<!doctype html>
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Verifacts</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2212%22%20fill%3D%22%230a0a0a%22%2F%3E%3Ctext%20x%3D%2232%22%20y%3D%2244%22%20font-family%3D%22Arial%2Csans-serif%22%20font-size%3D%2234%22%20font-weight%3D%22700%22%20text-anchor%3D%22middle%22%3E%3Ctspan%20fill%3D%22%23f0f0f0%22%3EV%3C%2Ftspan%3E%3Ctspan%20fill%3D%22%23d0312d%22%3EF%3C%2Ftspan%3E%3C%2Ftext%3E%3C%2Fsvg%3E">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Barlow:wght@300;400&display=swap" rel="stylesheet">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#FFFFFF">
+  <title>Ecoa Saúde</title>
+  <link rel="icon" href="${ECOA_FAVICON}">
+  ${ECOA_FONTS}
   <style>
     :root {
-      --bg:    #0a0a0a;
-      --bg2:   #111;
-      --bg3:   #181818;
-      --line:  #222;
-      --line2: #2e2e2e;
-      --muted: #555;
-      --dim:   #888;
-      --text:  #ccc;
-      --white: #f0f0f0;
-      --red:   #d0312d;
-      --c-red:        #e53935;
-      --c-amber:      #fb8c00;
-      --c-blue:       #1e88e5;
-      --c-green:      #43a047;
-      --accent-blue:  #5b9bd5;
+      /* superfícies */
+      --side:  #F6F7F9;
+      --bg:    #FFFFFF;
+      --bg2:   #F6F7F9;
+      --bg3:   #EEF1F5;
+      --dock:  #F3F5F8;
+      --line:  #E6E8EC;
+      --line2: #D5D9E0;
+      /* texto */
+      --muted: #6B7280;
+      --dim:   #4A5260;
+      --text:  #1F242C;
+      --white: #0F1217;
+      /* marca (logo) */
+      --brand-red:  #D8282E;
+      --brand-blue: #2560CC;
+      --brand-blue-hover: #1E4FB0;
+      --red:   #C62828;
+      /* semântica do relatório */
+      --c-red:   #C62828;
+      --c-amber: #B45F06;
+      --c-blue:  #2560CC;
+      --c-green: #2E8B57;
+      --accent-blue: #2560CC;
+
+      --font: 'Figtree', system-ui, -apple-system, 'Segoe UI', sans-serif;
+      --side-w: 272px;
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html { scroll-behavior: smooth; }
+    html, body { height: 100%; }
     body {
       background: var(--bg);
       color: var(--text);
-      font-family: 'Barlow', sans-serif;
-      font-weight: 300;
+      font-family: var(--font);
       font-size: 16px;
       line-height: 1.6;
-      min-height: 100vh;
       -webkit-font-smoothing: antialiased;
+      overflow: hidden;
     }
     a { color: var(--dim); text-decoration: none; }
     a:hover { color: var(--white); }
+    button { font-family: inherit; }
+    :focus-visible { outline: 2px solid var(--accent-blue); outline-offset: 2px; border-radius: 8px; }
+    [hidden] { display: none !important; }
 
-    header {
-      border-bottom: 1px solid var(--line);
-      padding: 0 32px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      height: 62px;
-    }
-    .logo {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-weight: 700;
-      font-size: 26px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--white);
-    }
-    .logo span { color: var(--red); }
-    .header-right {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 13px;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }
+    /* ── Wordmark ───────────────────────────── */
+    .wm { font-weight: 800; letter-spacing: -0.02em; line-height: 1; }
+    .wm-a { color: var(--brand-red); }
+    .wm-b { color: #2560CC; }
+    .ecoa-mark { display: block; flex-shrink: 0; overflow: visible; }
 
-    .page-layout {
-      display: flex;
-      align-items: flex-start;
-      min-height: calc(100vh - 62px);
-    }
+    /* ── Estrutura ──────────────────────────── */
+    .app { display: flex; height: 100vh; height: 100dvh; }
 
     .sidebar {
-      width: 200px;
+      width: var(--side-w);
       flex-shrink: 0;
+      background: var(--side);
       border-right: 1px solid var(--line);
-      padding: 0;
-      position: sticky;
-      top: 0;
-      height: calc(100vh - 62px);
-      overflow-y: auto;
-      scrollbar-width: thin;
-      scrollbar-color: var(--line2) transparent;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
     }
-    .sidebar::-webkit-scrollbar { width: 3px; }
-    .sidebar::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 2px; }
-    @media (max-width: 900px) {
-      .page-layout { flex-direction: column; }
-      .sidebar { width: 100%; border-right: none; border-bottom: 1px solid var(--line); position: static; height: auto; }
-    }
+    .side-top { padding: 16px 14px 10px; }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px 16px; color: inherit; }
+    .brand .wm { font-size: 20px; }
+    .brand:hover { color: inherit; }
+    .icon-btn.side-close { display: none; margin-left: auto; }
 
+    .new-btn {
+      display: flex; align-items: center; gap: 10px;
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--line2);
+      border-radius: 12px;
+      color: var(--white);
+      font-size: 14.5px; font-weight: 600;
+      transition: background .15s, border-color .15s;
+    }
+    .new-btn:hover { background: var(--bg2); border-color: var(--muted); color: var(--white); }
+    .new-btn svg { color: var(--dim); }
+
+    .side-history { flex: 1; min-height: 0; overflow-y: auto; padding: 6px 8px 12px; scrollbar-width: thin; scrollbar-color: var(--line2) transparent; }
     .sidebar-label {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--muted);
-      padding: 18px 12px 8px 12px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 8px 6px;
+      font-size: 12.5px; font-weight: 600; color: var(--muted);
     }
-    .sidebar-clear {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--muted);
-      background: none;
-      border: none;
-      cursor: pointer;
-      padding: 0;
-      transition: color 0.15s;
-    }
+    .sidebar-clear { background: none; border: none; color: var(--muted); font-size: 12.5px; cursor: pointer; padding: 2px 4px; }
     .sidebar-clear:hover { color: var(--c-red); }
-    .sidebar-empty {
-      font-size: 13px;
-      color: var(--muted);
-      font-style: italic;
-      padding: 6px 12px;
-    }
-    .sidebar-items { display: flex; flex-direction: column; }
-    .sidebar-item {
-      display: flex;
-      align-items: center;
-      transition: background 0.15s;
-    }
+    .sidebar-empty { font-size: 13.5px; color: var(--muted); padding: 6px 8px; }
+    .sidebar-items { display: flex; flex-direction: column; gap: 1px; }
+    .sidebar-item { display: flex; align-items: center; border-radius: 10px; transition: background .12s; }
     .sidebar-item:hover { background: var(--bg2); }
     .sidebar-item-btn {
-      flex: 1;
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 15px;
-      font-weight: 400;
-      color: var(--dim);
-      background: none;
-      border: none;
-      padding: 7px 4px 7px 12px;
-      cursor: pointer;
-      text-align: left;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      transition: color 0.15s;
-      min-width: 0;
-      line-height: 1.3;
+      flex: 1; min-width: 0;
+      display: flex; align-items: center; gap: 10px;
+      background: none; border: none; cursor: pointer; text-align: left;
+      padding: 8px 4px 8px 10px;
+      font-size: 14px; color: var(--dim); line-height: 1.35;
     }
     .sidebar-item-btn:hover { color: var(--white); }
+    .h-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .h-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .h-dot-empty { border: 1px solid var(--line2); }
     .sidebar-item-del {
-      background: none;
-      border: none;
-      color: transparent;
-      font-size: 11px;
-      padding: 0 10px;
-      cursor: pointer;
-      transition: color 0.15s;
-      flex-shrink: 0;
-      line-height: 1;
+      display: grid; place-items: center;
+      width: 28px; height: 28px; margin-right: 4px;
+      background: none; border: none; border-radius: 8px;
+      color: transparent; cursor: pointer; flex-shrink: 0;
     }
-    .sidebar-item:hover .sidebar-item-del { color: var(--muted); }
-    .sidebar-item-del:hover { color: var(--c-red) !important; }
+    .sidebar-item:hover .sidebar-item-del, .sidebar-item-del:focus-visible { color: var(--muted); }
+    .sidebar-item-del:hover { color: var(--c-red) !important; background: var(--bg3); }
 
-    .main {
-      flex: 1;
-      min-width: 0;
-      padding: 0 32px 60px 28px;
+    .account { border-top: 1px solid var(--line); padding: 12px 14px 14px; }
+    .account-row { display: flex; align-items: center; gap: 10px; }
+    .avatar {
+      width: 34px; height: 34px; border-radius: 50%;
+      display: grid; place-items: center;
+      background: var(--brand-blue); color: #fff;
+      font-weight: 700; font-size: 15px; flex-shrink: 0;
     }
-    @media (max-width: 900px) { .main { padding: 0 20px 48px; } }
+    .account-id { flex: 1; min-width: 0; }
+    .account-name { font-size: 14px; font-weight: 600; color: var(--white); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3; }
+    .account-plan { font-size: 12.5px; color: var(--muted); line-height: 1.3; }
+    .icon-btn {
+      display: grid; place-items: center;
+      width: 34px; height: 34px; border-radius: 50%;
+      color: var(--muted); background: none; border: none; cursor: pointer; flex-shrink: 0;
+      transition: background .15s, color .15s;
+    }
+    .icon-btn:hover { background: var(--bg3); color: var(--white); }
+    a.icon-btn[href="/logout"]:hover { color: var(--c-red); }
+    .usage { margin-top: 10px; }
+    .usage-text { font-size: 12.5px; color: var(--muted); }
+    .usage-bar { height: 3px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 6px; }
+    .usage-fill { height: 100%; border-radius: 3px; }
+    .account-links { display: flex; gap: 16px; margin-top: 10px; font-size: 13.5px; font-weight: 500; }
+    .account-links a { color: var(--dim); }
+    .account-links a:hover { color: var(--white); }
+    .account-links .is-admin { color: #9A7400; }
 
-    .sec-label {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 13px;
-      font-weight: 600;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--muted);
-      padding: 28px 0 14px;
-      border-bottom: 1px solid var(--line);
-      margin-bottom: 20px;
-    }
+    /* ── Palco (área do chat) ───────────────── */
+    .stage { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+    .topbar { display: none; }
 
-    /* 🎯 Como funciona (método transparente) */
-    .steps-strip {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 14px;
-      padding: 24px 0 6px;
-    }
-    .step { display: flex; gap: 12px; align-items: flex-start; }
-    .step-num {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 26px; font-weight: 700;
-      color: var(--line2);
-      line-height: 1;
-      min-width: 34px;
-    }
-    .step-title {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 15px; font-weight: 600;
-      letter-spacing: 0.04em; text-transform: uppercase;
-      color: var(--white); margin-bottom: 3px;
-    }
-    .step-desc { font-size: 13px; color: var(--muted); line-height: 1.5; }
+    .thread { overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line2) transparent; }
+    .thread-inner { width: 100%; max-width: 820px; margin: 0 auto; padding: 0 24px; }
 
-    /* 🎯 Exemplos clicáveis */
-    .examples-label {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 11px; font-weight: 600;
-      letter-spacing: 0.12em; text-transform: uppercase;
-      color: var(--muted); margin: 14px 0 8px;
-    }
-    .example-chips { display: flex; flex-wrap: wrap; gap: 8px; }
-    .chip {
-      background: var(--bg3);
-      border: 1px solid var(--line2);
-      color: var(--dim);
-      font-family: 'Barlow', sans-serif;
-      font-size: 12.5px;
-      padding: 7px 12px;
-      border-radius: 14px;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .chip:hover { border-color: var(--accent-blue, #5b9bd5); color: var(--white); background: rgba(91,155,213,0.08); }
+    body.is-home .stage { overflow-y: auto; }
+    body.is-home .thread { flex: none; overflow: visible; margin-top: auto; padding-top: 24px; }
+    body.is-home .dock { margin-bottom: auto; padding-bottom: 32px; }
+    body.is-chat .thread { flex: 1; min-height: 0; }
+    body.is-chat .hero, body.is-chat .suggestions { display: none; }
+    body.is-home .msg-result { display: none; }
 
-    /* 🎯 Fontes consultadas */
-    .sources-strip {
-      display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 22px;
-      margin-top: 20px; padding: 14px 18px;
-      background: var(--bg2, #111);
-      border: 1px solid var(--line);
-      border-radius: 2px;
-      font-size: 13px;
-    }
-    .sources-title {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 12px; font-weight: 600;
-      letter-spacing: 0.1em; text-transform: uppercase;
-      color: var(--muted);
-    }
-    .source-item { color: var(--dim); white-space: nowrap; }
-    .source-sub { color: var(--muted); font-size: 12px; }
-
-    .forms-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1px;
-      background: var(--line);
-      margin-bottom: 1px;
-    }
-    @media (max-width: 680px) { .forms-grid { grid-template-columns: 1fr; } }
-    .form-panel {
-      background: var(--bg);
-      padding: 28px 28px 24px;
-    }
-    .form-panel:last-child { border-left: none; }
-
-    .panel-title {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 18px;
-      font-weight: 600;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--white);
-      margin-bottom: 18px;
-    }
-
-    .field { margin-bottom: 14px; }
-    .field-label {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 12px;
-      font-weight: 600;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--muted);
-      display: flex;
-      justify-content: space-between;
-      margin-bottom: 6px;
-    }
-    textarea.fi, input[type="text"].fi {
-      width: 100%;
-      background: var(--bg2);
-      border: 1px solid var(--line2);
-      border-radius: 2px;
-      color: var(--white);
-      font-family: 'Barlow', sans-serif;
-      font-weight: 300;
-      font-size: 16px;
-      padding: 11px 13px;
-      outline: none;
-      transition: border-color 0.15s;
-      resize: vertical;
-    }
-    textarea.fi { min-height: 120px; }
-    textarea.fi:focus, input[type="text"].fi:focus { border-color: var(--dim); }
-    textarea.fi::placeholder, input[type="text"].fi::placeholder { color: var(--muted); }
-
-    .char-warning { color: var(--c-red); }
-
-    .file-zone {
-      width: 100%;
-      background: var(--bg2);
-      border: 1px dashed var(--line2);
-      border-radius: 2px;
-      padding: 18px 16px;
-      text-align: center;
-      cursor: pointer;
-      position: relative;
-      transition: border-color 0.15s;
-    }
-    .file-zone:hover { border-color: var(--dim); }
-    .file-zone input { position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%; }
-    .file-zone-text {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 14px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }
-    .file-selected {
-      margin-top: 6px;
-      font-size: 13px;
-      color: var(--dim);
-      display: none;
-    }
-
-    .btn {
-      width: 100%;
-      margin-top: 16px;
-      padding: 13px 16px;
-      background: var(--white);
-      color: var(--bg);
-      border: none;
-      border-radius: 2px;
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 15px;
-      font-weight: 700;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      cursor: pointer;
-      transition: background 0.15s, opacity 0.15s;
-    }
-    .btn:hover { background: #d8d8d8; }
-    .btn:disabled { opacity: 0.3; cursor: not-allowed; }
-    .field-help {
-      margin-top: 7px;
-      font-size: 13px;
-      color: var(--muted);
-    }
-
-    .result-section {
-      background: var(--bg);
-      border: 1px solid var(--line);
-    }
-    .result-section-head {
-      padding: 14px 24px;
-      border-bottom: 1px solid var(--line);
-      background: var(--bg3);
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--accent-blue);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .result-section-head::before {
-      content: '';
-      display: inline-block;
-      width: 7px; height: 7px;
+    /* Boas-vindas */
+    .hero { text-align: center; padding: 0 0 28px; }
+    .hero-mark { position: relative; width: 84px; height: 74px; margin: 0 auto 22px; }
+    .hero-mark .ecoa-mark { position: relative; z-index: 1; }
+    .echo {
+      position: absolute; left: 50%; top: 48%;
+      width: 84px; height: 84px; margin: -42px 0 0 -42px;
       border-radius: 50%;
-      background: var(--accent-blue);
+      border: 1.5px solid var(--brand-red);
+      opacity: 0;
+      animation: echo 1.8s cubic-bezier(.2,.6,.3,1) .15s 1 both;
     }
-    .result-body { padding: 28px; }
-    .no-result { color: var(--muted); font-size: 15px; }
-
-    .result-wrap { display: flex; flex-direction: column; gap: 26px; }
-
-    .r-meta {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-      padding-bottom: 14px;
-      border-bottom: 1px solid var(--line);
+    .echo.e2 { border-color: #2560CC; animation-delay: .55s; }
+    @keyframes echo {
+      0%   { transform: scale(.7); opacity: .55; }
+      100% { transform: scale(2.1); opacity: 0; }
     }
+    .hero h1 { font-size: clamp(26px, 3.4vw, 34px); font-weight: 700; color: var(--white); letter-spacing: -0.015em; line-height: 1.2; }
+    .hero p { margin: 10px auto 0; max-width: 46ch; font-size: 16px; color: var(--dim); }
+
+    /* Mensagens */
+    .msg-result, .pending { padding: 32px 0 24px; }
+    .msg-user {
+      margin: 0 0 22px auto;
+      max-width: min(78%, 560px);
+      width: fit-content;
+      background: var(--dock);
+      color: var(--white);
+      padding: 11px 16px;
+      border-radius: 20px 20px 6px 20px;
+      font-size: 15.5px;
+      overflow-wrap: anywhere;
+    }
+    .msg-user-file { display: flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--dim); }
+    .msg-user-file + .msg-user-text:not(:empty) { margin-top: 6px; }
+    .msg-bot { display: grid; grid-template-columns: 34px 1fr; gap: 14px; align-items: start; }
+    .bot-avatar {
+      width: 34px; height: 34px; border-radius: 50%;
+      background: #fff;
+      box-shadow: inset 0 0 0 1px var(--line);
+      display: grid; place-items: center;
+    }
+    .bot-name { font-size: 14px; font-weight: 700; color: var(--white); line-height: 34px; }
+    .bot-body { min-width: 0; }
+
+    /* Pensando (usa as bolinhas do símbolo) */
+    .thinking .mk-dot { transform-box: fill-box; transform-origin: center; animation: think 1.1s ease-in-out infinite; }
+    .thinking .mk-dot:nth-of-type(2) { animation-delay: .15s; }
+    .thinking .mk-dot:nth-of-type(3) { animation-delay: .3s; }
+    @keyframes think {
+      0%, 60%, 100% { transform: translateY(0); opacity: .55; }
+      30% { transform: translateY(-2.5px); opacity: 1; }
+    }
+    .think-title { font-size: 15.5px; color: var(--white); margin: 2px 0 12px; }
+    .l-steps { display: flex; flex-direction: column; gap: 2px; }
+    .l-step { display: flex; align-items: center; gap: 10px; font-size: 14.5px; color: var(--muted); padding: 3px 0; transition: color .3s; }
+    .l-dot { width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--line2); flex-shrink: 0; transition: all .3s; }
+    .l-step.active { color: var(--white); }
+    .l-step.active .l-dot { border-color: var(--accent-blue); background: var(--accent-blue); box-shadow: 0 0 0 4px rgba(37,96,204,.16); }
+    .l-step.done { color: var(--dim); }
+    .l-step.done .l-dot { border-color: var(--c-green); background: var(--c-green); }
+
+    /* ── Composer (barra de chat) ───────────── */
+    .dock { width: 100%; max-width: 820px; margin: 0 auto; padding: 0 24px 14px; }
+    body.is-chat .dock { padding-top: 6px; }
+    .composer {
+      background: var(--dock);
+      border: 1px solid #E3E6EB;
+      border-radius: 28px;
+      padding: 7px;
+      box-shadow: 0 1px 2px rgba(16,24,40,.04), 0 6px 20px rgba(16,24,40,.06);
+      transition: border-color .15s, box-shadow .15s;
+    }
+    .composer:focus-within { border-color: #B9C0CB; background: #fff; }
+    .composer.is-drag { border-color: var(--accent-blue); box-shadow: 0 0 0 3px rgba(37,96,204,.18); }
+    .composer.is-busy { opacity: .7; }
+
+    .attach {
+      display: flex; align-items: center; gap: 10px;
+      margin: 3px 3px 6px; padding: 8px 10px 8px 8px;
+      width: fit-content; max-width: calc(100% - 6px);
+      background: var(--bg3); border: 1px solid var(--line2); border-radius: 14px;
+    }
+    .attach-ico { width: 34px; height: 34px; border-radius: 9px; background: var(--brand-blue); color: #fff; display: grid; place-items: center; flex-shrink: 0; }
+    .attach-txt { min-width: 0; line-height: 1.25; }
+    .attach-name { font-size: 13.5px; color: var(--white); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 38ch; }
+    .attach-meta { font-size: 12px; color: var(--muted); }
+    .attach .icon-btn { width: 26px; height: 26px; }
+
+    .composer-row { display: flex; align-items: flex-end; gap: 4px; }
+    .c-btn {
+      width: 42px; height: 42px; border-radius: 50%;
+      display: grid; place-items: center;
+      background: none; border: none; color: var(--white);
+      cursor: pointer; flex-shrink: 0;
+      transition: background .15s, color .15s;
+    }
+    .c-btn:hover { background: #E3E6EB; }
+    .c-btn.is-live { color: var(--c-red); background: rgba(239,83,87,.14); }
+    .c-btn input[type=file] { display: none; }
+
+    .composer textarea {
+      flex: 1; min-width: 0;
+      background: none; border: none; outline: none; resize: none;
+      color: var(--white);
+      font-family: var(--font); font-size: 16.5px; line-height: 1.5;
+      padding: 9px 6px;
+      height: 42px; max-height: 168px;
+    }
+    .composer textarea::placeholder { color: #7A818C; }
+
+    .counter { align-self: center; font-size: 12.5px; color: var(--muted); padding: 0 6px; font-variant-numeric: tabular-nums; }
+    .counter.is-max { color: var(--c-red); }
+
+    .send {
+      width: 42px; height: 42px; border-radius: 50%;
+      display: grid; place-items: center;
+      background: var(--brand-blue); color: #fff;
+      border: none; cursor: pointer; flex-shrink: 0;
+      transition: background .15s, transform .1s;
+    }
+    .send:hover:not(:disabled) { background: var(--brand-blue-hover); }
+    .send:active:not(:disabled) { transform: scale(.94); }
+    .send:disabled { background: #E3E6EB; color: #9AA1AC; cursor: default; }
+
+    .suggestions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 16px; }
+    .sugg {
+      background: none; border: 1px solid var(--line2); border-radius: 999px;
+      color: var(--dim); font-size: 14px; padding: 7px 14px; cursor: pointer;
+      transition: border-color .15s, color .15s, background .15s;
+    }
+    .sugg:hover { border-color: var(--muted); color: var(--white); background: var(--bg2); }
+
+    .dock-note { text-align: center; font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+    .dock-note.is-error { color: var(--c-red); }
+
+    /* ══ Relatório (classes geradas pelo servidor) ══ */
+    .result-body { min-width: 0; }
+    .no-result { color: var(--text); font-size: 15.5px; padding-top: 6px; }
+    .result-wrap { display: flex; flex-direction: column; gap: 26px; padding-top: 6px; }
+
+    .r-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .r-tag {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      background: var(--white);
-      color: var(--bg);
-      padding: 3px 10px;
-      border-radius: 1px;
+      font-size: 12px; font-weight: 700; letter-spacing: .02em;
+      background: var(--bg3); color: var(--white);
+      border: 1px solid var(--line2);
+      padding: 2px 10px; border-radius: 999px;
     }
-    .r-ts {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 13px;
-      letter-spacing: 0.06em;
-      color: var(--muted);
-    }
-    .r-query {
-      font-size: 13px;
-      color: var(--dim);
-      font-style: italic;
-    }
+    .r-ts { font-size: 13px; color: var(--muted); }
+    .r-query { font-size: 13.5px; color: var(--dim); font-style: italic; }
 
     .verdict-block {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 20px;
-      padding: 22px 24px;
-      border: 1px solid var(--line2);
-      border-radius: 2px;
-      border-left: 4px solid;
+      display: flex; justify-content: space-between; align-items: flex-start; gap: 20px;
+      padding: 20px 22px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--bg2);
+      position: relative; overflow: hidden;
     }
-    .verdict-block.vf { border-left-color: var(--c-red);    background: rgba(211,47,47,0.06); }
-    .verdict-block.vs { border-left-color: var(--c-amber);  background: rgba(245,124,0,0.06); }
-    .verdict-block.vn { border-left-color: var(--c-blue);   background: rgba(30,136,229,0.06); }
-    .verdict-block.vt { border-left-color: var(--c-green);  background: rgba(56,142,60,0.06); }
-
-    .verdict-label {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 22px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      margin-bottom: 6px;
-    }
-    .vf .verdict-label { color: var(--c-red); }
-    .vs .verdict-label { color: var(--c-amber); }
-    .vn .verdict-label { color: var(--c-blue); }
-    .vt .verdict-label { color: var(--c-green); }
-
-    .verdict-summary { font-size: 15px; color: var(--dim); line-height: 1.55; max-width: 520px; }
-    .verdict-right { text-align: right; flex-shrink: 0; min-width: 88px; }
-    .conf-num {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 40px;
-      font-weight: 700;
-      line-height: 1;
-    }
-    .vf .conf-num { color: var(--c-red); }
-    .vs .conf-num { color: var(--c-amber); }
-    .vn .conf-num { color: var(--c-blue); }
-    .vt .conf-num { color: var(--c-green); }
-    .conf-unit { font-size: 20px; }
-    .conf-desc {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 11px;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin: 4px 0 8px;
-    }
-    .conf-bar { height: 3px; background: var(--line2); border-radius: 1px; overflow: hidden; }
+    .verdict-block::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; }
+    .verdict-block.vf { background: #FDF1F1; border-color: #F3CFCF; }
+    .verdict-block.vs { background: #FDF5EA; border-color: #F1DDBE; }
+    .verdict-block.vn { background: #EEF3FC; border-color: #CCDAF3; }
+    .verdict-block.vt { background: #EDF7F1; border-color: #C8E6D4; }
+    .verdict-block.vf::before { background: var(--c-red); }
+    .verdict-block.vs::before { background: var(--c-amber); }
+    .verdict-block.vn::before { background: var(--c-blue); }
+    .verdict-block.vt::before { background: var(--c-green); }
+    .verdict-label { font-size: 22px; font-weight: 800; letter-spacing: -0.01em; line-height: 1.2; margin-bottom: 6px; }
+    .vf .verdict-label, .vf .conf-num { color: var(--c-red); }
+    .vs .verdict-label, .vs .conf-num { color: var(--c-amber); }
+    .vn .verdict-label, .vn .conf-num { color: var(--c-blue); }
+    .vt .verdict-label, .vt .conf-num { color: var(--c-green); }
+    .verdict-summary { font-size: 15.5px; color: var(--text); line-height: 1.55; max-width: 560px; }
+    .verdict-right { text-align: right; flex-shrink: 0; min-width: 92px; }
+    .conf-num { font-size: 38px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+    .conf-unit { font-size: 19px; }
+    .conf-desc { font-size: 12px; color: var(--muted); margin: 4px 0 8px; }
+    .conf-bar { height: 4px; background: var(--line); border-radius: 4px; overflow: hidden; }
+    .conf-fill { height: 100%; border-radius: 4px; }
     .vf .conf-fill { background: var(--c-red); }
     .vs .conf-fill { background: var(--c-amber); }
     .vn .conf-fill { background: var(--c-blue); }
     .vt .conf-fill { background: var(--c-green); }
-    .conf-fill { height: 100%; border-radius: 1px; }
 
-    .block-label {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--accent-blue);
-      margin-bottom: 14px;
-      padding-bottom: 8px;
-      border-bottom: 1px solid var(--line);
-    }
-    .reply-block {
-      padding: 20px 22px;
-      border: 1px solid var(--line);
-      border-radius: 2px;
-      border-left: 3px solid var(--accent-blue);
-      background: rgba(30,136,229,0.04);
-    }
-    .reply-text { font-size: 17px; color: var(--text); line-height: 1.65; }
+    .block-label { font-size: 15px; font-weight: 700; color: var(--white); margin-bottom: 12px; }
+    .reply-block { padding: 18px 20px; border-radius: 18px; background: var(--bg2); border: 1px solid var(--line); }
+    .reply-text { font-size: 16.5px; color: var(--text); line-height: 1.7; }
 
     .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
-    @media (max-width: 680px) { .two-col { grid-template-columns: 1fr; } }
-
-    .reasons-list { display: flex; flex-direction: column; gap: 13px; }
-    .reason-row { display: flex; gap: 13px; align-items: flex-start; }
-    .reason-i {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 14px;
-      color: var(--accent-blue);
-      flex-shrink: 0;
-      padding-top: 2px;
-      min-width: 24px;
-      font-weight: 700;
-    }
-    .reason-t { font-size: 16px; color: var(--text); line-height: 1.5; }
+    .reasons-list { display: flex; flex-direction: column; gap: 12px; }
+    .reason-row { display: flex; gap: 12px; align-items: flex-start; }
+    .reason-i { font-size: 13px; font-weight: 700; color: var(--accent-blue); min-width: 22px; padding-top: 3px; font-variant-numeric: tabular-nums; }
+    .reason-t { font-size: 15.5px; color: var(--text); line-height: 1.55; }
 
     .src-list { display: flex; flex-direction: column; gap: 8px; }
-    .src-item {
-      padding: 14px 16px;
-      border: 1px solid var(--line);
-      border-radius: 2px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      transition: border-color 0.15s;
-    }
+    .src-item { padding: 13px 15px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg2); display: flex; flex-direction: column; gap: 6px; transition: border-color .15s; }
     .src-item:hover { border-color: var(--line2); }
     .src-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-
-    .src-pub {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--white);
-    }
-    .src-rating {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 12px;
-      letter-spacing: 0.06em;
-      color: var(--muted);
-      text-align: right;
-    }
+    .src-pub { font-size: 13.5px; font-weight: 700; color: var(--white); }
+    .src-rating { font-size: 12.5px; color: var(--muted); text-align: right; }
     .src-text { font-size: 14px; color: var(--dim); line-height: 1.5; }
-    .src-link {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      color: var(--muted);
-      word-break: break-all;
-      transition: color 0.15s;
-    }
-    .src-link:hover { color: var(--white); }
+    .src-link { font-size: 12px; color: var(--muted); word-break: break-all; }
+    .src-link:hover { color: var(--accent-blue); }
+
+    .steps-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+    .step { display: flex; gap: 12px; align-items: flex-start; }
+    .step-num { font-size: 22px; font-weight: 800; color: var(--line2); line-height: 1; min-width: 30px; }
+    .step-title { font-size: 15px; font-weight: 700; color: var(--white); margin-bottom: 3px; }
+    .step-desc { font-size: 13.5px; color: var(--muted); line-height: 1.5; }
+    .examples-label { font-size: 13px; font-weight: 600; color: var(--muted); margin: 14px 0 8px; }
+    .example-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chip { background: none; border: 1px solid var(--line2); color: var(--dim); font-size: 13px; padding: 6px 12px; border-radius: 999px; cursor: pointer; }
+    .chip:hover { border-color: var(--accent-blue); color: var(--white); }
+    .sources-strip { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 22px; padding: 14px 18px; background: var(--bg2); border: 1px solid var(--line); border-radius: 14px; font-size: 13px; }
+    .sources-title { font-size: 13px; font-weight: 700; color: var(--muted); }
+    .source-item { color: var(--dim); white-space: nowrap; }
+    .source-sub { color: var(--muted); font-size: 12px; }
 
     .carousel-outer { position: relative; }
     .carousel-viewport { overflow: hidden; width: 100%; }
-    .carousel-track { display: flex; gap: 12px; transition: transform 0.35s cubic-bezier(0.25,0.46,0.45,0.94); will-change: transform; }
+    .carousel-track { display: flex; gap: 12px; transition: transform .35s cubic-bezier(.25,.46,.45,.94); will-change: transform; }
     .news-slide {
       flex: 0 0 calc((100% - 24px) / 3);
-      padding: 16px 18px;
-      border: 1px solid var(--line);
-      border-radius: 2px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      background: var(--bg2);
-      transition: border-color 0.15s;
-      box-sizing: border-box;
-    }
-    @media (max-width: 820px) { .news-slide { flex: 0 0 calc((100% - 12px) / 2); } }
-    @media (max-width: 560px) { .news-slide { flex: 0 0 100%; } }
-
-    /* ══════════════════════════════════════════════════
-       📱 [FIX MOBILE v2] Relatório 100% responsivo
-       Regra de ouro: nada pode ser mais largo que a tela.
-       ══════════════════════════════════════════════════ */
-
-    /* 1. Trava estrutural da página */
-    html { overflow-x: hidden; }
-    body { width: 100%; max-width: 100%; overflow-x: hidden; }
-    header, footer, .page-layout, .sidebar, .main { max-width: 100%; min-width: 0; }
-
-    /* 2. Nada dentro do relatório pode estourar a largura */
-    .result-section { max-width: 100%; overflow: hidden; }
-    .result-body, .result-wrap {
-      max-width: 100%; min-width: 0;
-      overflow-wrap: anywhere; word-break: break-word;
-    }
-    .result-body *, .result-wrap * { min-width: 0; max-width: 100%; }
-    .result-body img, .result-wrap img { max-width: 100% !important; height: auto; }
-    .two-col > *, .src-list, .reasons-list { min-width: 0; }
-    .verdict-summary { max-width: 100%; }
-    .src-link, .news-readlink, .news-title, .transcript {
-      word-break: break-word; overflow-wrap: anywhere;
-    }
-
-    /* 3. Overlays / tooltips não podem empurrar a tela */
-    .loading-card { width: min(380px, calc(100vw - 28px)); max-width: 100%; }
-    .tech-info[data-tip]::after, .tech-info-tip { max-width: min(230px, 78vw) !important; }
-
-    @media (max-width: 700px) {
-      /* header */
-      header { height: auto; min-height: 62px; flex-wrap: wrap; padding: 10px 16px; row-gap: 8px; }
-      header > div { flex-wrap: wrap !important; gap: 8px 14px !important; }
-
-      /* menos padding = mais texto visível */
-      .main { padding: 0 12px 40px; }
-      .result-section-head { padding: 12px 14px; }
-      .result-body { padding: 16px 14px; }
-      .result-wrap { gap: 20px; }
-      .verdict-block { flex-direction: column; gap: 14px; padding: 16px 14px; }
-      .verdict-right { text-align: left; min-width: 0; width: 100%; }
-      .conf-num { font-size: 32px; }
-      .reply-block { padding: 16px 14px; }
-      .reply-text { font-size: 15.5px; }
-      .reason-t, .src-text { font-size: 14.5px; }
-      .src-item { padding: 12px 13px; }
-      .news-slide { padding: 14px 14px; }
-
-      /* grids viram coluna única — inclui os grids com style inline da seção de IA */
-      .two-col { grid-template-columns: 1fr; }
-      .result-body [style*="grid-template-columns"] { grid-template-columns: 1fr !important; }
-      .result-body [style*="repeat(auto-fill"],
-      .result-body [style*="repeat(auto-fit"] {
-        grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)) !important;
-      }
-
-      /* linhas que antes forçavam largura */
-      .source-item { white-space: normal; }
-      .sources-strip { gap: 6px 16px; padding: 12px 14px; }
-      .steps-strip { gap: 10px; padding-top: 16px; }
-      .r-meta { flex-wrap: wrap; gap: 8px; }
-      .r-query { width: 100%; }
-      .src-row { flex-wrap: wrap; }
-      .src-rating { text-align: left; }
-    }
-
-    @media (max-width: 420px) {
-      .main { padding: 0 10px 36px; }
-      .result-body { padding: 14px 11px; }
-      .verdict-label { font-size: 19px; }
-      .reply-text { font-size: 15px; }
-      .block-label { font-size: 12px; letter-spacing: 0.1em; }
+      padding: 15px 16px; border: 1px solid var(--line); border-radius: 14px;
+      display: flex; flex-direction: column; gap: 10px;
+      background: var(--bg2); transition: border-color .15s;
     }
     .news-slide:hover { border-color: var(--line2); }
-
-    .news-readlink {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      margin-top: auto;
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 13px;
-      font-weight: 600;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--accent-blue);
-      transition: color 0.15s, gap 0.15s;
-    }
-    .news-readlink:hover { color: var(--white); gap: 9px; }
-
-    .carousel-nav {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-top: 12px;
-    }
-    .carousel-arrows { display: flex; gap: 6px; }
-    .carousel-btn {
-      width: 34px; height: 34px;
-      background: var(--bg3);
-      border: 1px solid var(--line2);
-      color: var(--dim);
-      font-size: 16px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: color 0.15s, background 0.15s;
-      border-radius: 2px;
-      padding: 0;
-      line-height: 1;
-    }
-    .carousel-btn:hover { color: var(--white); background: var(--line2); }
-    .carousel-btn:disabled { opacity: 0.25; cursor: default; }
-
-    .carousel-dots { display: flex; gap: 6px; align-items: center; }
-    .c-dot {
-      width: 6px; height: 6px;
-      border-radius: 50%;
-      border: 1px solid var(--muted);
-      background: transparent;
-      cursor: pointer;
-      padding: 0;
-      transition: background 0.15s, border-color 0.15s, transform 0.15s;
-    }
-    .c-dot.active {
-      background: var(--accent-blue);
-      border-color: var(--accent-blue);
-      transform: scale(1.4);
-    }
-
     .news-header { display: flex; align-items: center; gap: 10px; }
-    .news-favicon-wrap { width: 28px; height: 28px; flex-shrink: 0; }
-    .news-favicon {
-      width: 28px; height: 28px;
-      border-radius: 4px;
-      object-fit: contain;
-      background: var(--bg3);
-      display: block;
-    }
-    .news-favicon-fallback {
-      width: 28px; height: 28px;
-      border-radius: 4px;
-      background: var(--line2);
-      color: var(--dim);
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 11px;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
+    .news-favicon-wrap { width: 26px; height: 26px; flex-shrink: 0; }
+    .news-favicon { width: 26px; height: 26px; border-radius: 6px; object-fit: contain; background: var(--bg3); display: block; }
+    .news-favicon-fallback { width: 26px; height: 26px; border-radius: 6px; background: var(--line2); color: var(--dim); font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
     .news-header .src-pub { flex: 1; }
     .news-header .src-rating { flex-shrink: 0; }
-    .news-title {
-      font-size: 16px;
-      color: var(--white);
-      line-height: 1.45;
-      font-weight: 400;
-      font-family: 'Barlow', sans-serif;
-    }
+    .news-title { font-size: 15px; color: var(--white); line-height: 1.45; font-weight: 500; }
+    .news-readlink { display: inline-flex; align-items: center; gap: 5px; margin-top: auto; font-size: 13.5px; font-weight: 600; color: var(--accent-blue); }
+    .news-readlink:hover { color: var(--white); }
+    .carousel-nav { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; }
+    .carousel-arrows { display: flex; gap: 6px; }
+    .carousel-btn { width: 34px; height: 34px; border-radius: 50%; background: var(--bg3); border: 1px solid var(--line2); color: var(--dim); font-size: 15px; cursor: pointer; display: grid; place-items: center; padding: 0; line-height: 1; }
+    .carousel-btn:hover { color: var(--white); background: var(--line2); }
+    .carousel-btn:disabled { opacity: .3; cursor: default; }
+    .carousel-dots { display: flex; gap: 6px; align-items: center; }
+    .c-dot { width: 6px; height: 6px; border-radius: 50%; border: 1px solid var(--muted); background: transparent; cursor: pointer; padding: 0; transition: all .15s; }
+    .c-dot.active { background: var(--accent-blue); border-color: var(--accent-blue); transform: scale(1.35); }
 
-    .empty-msg { font-size: 15px; color: var(--muted); padding: 12px 0; font-style: italic; }
-    .transcript {
-      font-size: 15px;
-      color: var(--dim);
-      line-height: 1.7;
-      white-space: pre-wrap;
-      padding: 16px;
-      border: 1px solid var(--line);
-      border-radius: 2px;
-    }
-    .disclaimer {
-      font-size: 13px;
-      color: var(--muted);
-      padding-top: 16px;
-      border-top: 1px solid var(--line);
-    }
+    .empty-msg { font-size: 15px; color: var(--muted); padding: 10px 0; font-style: italic; }
+    .transcript { font-size: 15px; color: var(--dim); line-height: 1.7; white-space: pre-wrap; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg2); }
+    .disclaimer { font-size: 13px; color: var(--muted); padding-top: 16px; border-top: 1px solid var(--line); }
+    .char-warning { color: var(--c-red); }
 
-    footer {
-      border-top: 1px solid var(--line);
-      padding: 18px 32px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .footer-logo {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-weight: 700;
-      font-size: 16px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--dim);
-    }
-    .footer-logo span { color: var(--red); }
-    .footer-note {
-      font-size: 13px;
-      color: var(--muted);
-    }
-
-    #loading-overlay {
-      display: none;
-      position: fixed;
-      inset: 0;
-      z-index: 9999;
-      background: rgba(10,10,10,0.96);
-      align-items: center;
-      justify-content: center;
-    }
-    #loading-overlay.active { display: flex; }
-    .loading-card {
-      width: 380px;
-      border: 1px solid var(--line2);
-      border-top: 2px solid var(--accent-blue);
-      border-radius: 2px;
-      background: var(--bg2);
-      padding: 36px 32px;
-    }
-    .loading-logo-text {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-weight: 700;
-      font-size: 18px;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--white);
-      margin-bottom: 24px;
-    }
-    .loading-logo-text span { color: var(--red); }
-    .loading-title {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 22px;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--white);
-      margin-bottom: 4px;
-    }
-    .loading-sub {
-      font-size: 14px;
-      color: var(--muted);
-      margin-bottom: 28px;
-      line-height: 1.5;
-    }
-    .l-steps { display: flex; flex-direction: column; gap: 0; }
-    .l-step {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 10px 0;
-      border-bottom: 1px solid var(--line);
-      transition: color 0.3s;
-    }
-    .l-step:last-child { border-bottom: none; }
-    .l-dot {
-      width: 7px; height: 7px;
-      border-radius: 50%;
-      border: 1px solid var(--line2);
-      flex-shrink: 0;
-      transition: all 0.3s;
-    }
-    .l-step.active .l-dot { background: var(--accent-blue); border-color: var(--accent-blue); }
-    .l-step.done .l-dot { background: var(--muted); border-color: var(--muted); }
-    .l-step-text {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 14px;
-      font-weight: 500;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--muted);
-      flex: 1;
-      transition: color 0.3s;
-    }
-    .l-step.active .l-step-text { color: var(--white); }
-    .l-step.done .l-step-text { color: var(--muted); }
-    .l-step-st {
-      font-family: 'Barlow Condensed', sans-serif;
-      font-size: 12px;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-      width: 32px;
-      text-align: right;
-    }
-    .l-step.active .l-step-st { color: var(--accent-blue); }
-    .l-step.done .l-step-st { color: var(--muted); }
-
-    .loading-spinner {
-      width: 18px; height: 18px;
-      border: 1px solid var(--line2);
-      border-top-color: var(--white);
-      border-radius: 50%;
-      animation: spin 0.7s linear infinite;
-      margin-left: auto;
-      margin-top: 20px;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    /* 🔴 [NOVO] Animação de pulso das bolinhas de rastro de IA */
-    @keyframes pulse-dot {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.45; }
-    }
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
     .tech-info {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 15px;
-      height: 15px;
-      min-width: 15px;
-      border-radius: 50%;
-      background: #444;
-      color: #fff;
-      font-size: 10px;
-      font-weight: 700;
-      font-family: 'Barlow Condensed', sans-serif;
-      cursor: help;
-      position: relative;
-      line-height: 1;
-      transition: background 0.15s;
-      outline: none;
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 16px; height: 16px; min-width: 16px; border-radius: 50%;
+      background: #9AA1AC; color: #fff; font-size: 10px; font-weight: 700;
+      cursor: help; position: relative; line-height: 1; outline: none;
     }
-    .tech-info:hover, .tech-info:focus { background: #1e88e5; }
+    .tech-info:hover, .tech-info:focus { background: var(--brand-blue); color: #fff; }
     .tech-info::after {
       content: attr(data-tip);
-      position: absolute;
-      bottom: calc(100% + 8px);
-      left: 50%;
-      transform: translateX(-50%);
-      background: #000;
-      color: #eee;
-      border: 1px solid #1e88e5;
-      border-radius: 6px;
-      padding: 10px 12px;
-      width: 230px;
-      font-size: 12px;
-      font-weight: 400;
-      font-family: 'Barlow', sans-serif;
-      line-height: 1.5;
-      text-align: left;
-      white-space: normal;
-      opacity: 0;
-      visibility: hidden;
-      transition: opacity 0.15s, visibility 0.15s;
-      z-index: 100;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.6);
-      pointer-events: none;
+      position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+      background: #F6F7F9; color: #1F242C; border: 1px solid var(--line2); border-radius: 10px;
+      padding: 10px 12px; width: 230px; max-width: min(230px, 78vw);
+      font-size: 12.5px; font-weight: 400; font-family: var(--font); line-height: 1.5; text-align: left; white-space: normal;
+      opacity: 0; visibility: hidden; transition: opacity .15s, visibility .15s;
+      z-index: 100; box-shadow: 0 8px 24px rgba(16,24,40,.14); pointer-events: none;
     }
-    .tech-info::before {
-      content: '';
-      position: absolute;
-      bottom: calc(100% + 2px);
-      left: 50%;
-      transform: translateX(-50%);
-      border: 6px solid transparent;
-      border-top-color: #1e88e5;
-      opacity: 0;
-      visibility: hidden;
-      transition: opacity 0.15s, visibility 0.15s;
-      z-index: 101;
+    .tech-info:hover::after, .tech-info:focus::after { opacity: 1; visibility: visible; }
+
+    /* Nada dentro do relatório pode estourar a largura */
+    .result-body, .result-wrap { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+    .result-body *, .result-wrap * { min-width: 0; max-width: 100%; }
+    .result-body img { max-width: 100% !important; height: auto; }
+    .src-link, .news-readlink, .news-title, .transcript { word-break: break-word; overflow-wrap: anywhere; }
+
+    .backdrop { display: none; }
+
+    /* ── Responsivo ─────────────────────────── */
+    @media (max-width: 900px) {
+      .sidebar {
+        position: fixed; inset: 0 auto 0 0; z-index: 50;
+        width: min(300px, 86vw);
+        transform: translateX(-100%);
+        transition: transform .22s ease;
+      }
+      body.side-open .sidebar { transform: none; }
+      .backdrop { display: block; position: fixed; inset: 0; z-index: 40; background: rgba(15,18,23,.35); opacity: 0; pointer-events: none; transition: opacity .22s; }
+      body.side-open .backdrop { opacity: 1; pointer-events: auto; }
+      .icon-btn.side-close { display: grid; }
+
+      .topbar {
+        display: flex; align-items: center; gap: 6px;
+        padding: 8px 10px; flex-shrink: 0;
+      }
+      .topbar .brand { padding: 0; gap: 8px; }
+      .topbar .brand .wm { font-size: 17px; }
+      .topbar .spacer { flex: 1; }
+      body.is-home .topbar { position: sticky; top: 0; background: var(--bg); z-index: 5; }
+
+      .news-slide { flex: 0 0 calc((100% - 12px) / 2); }
     }
-    .tech-info:hover::after, .tech-info:focus::after,
-    .tech-info:hover::before, .tech-info:focus::before {
-      opacity: 1;
-      visibility: visible;
+    @media (max-width: 680px) {
+      .thread-inner { padding: 0 16px; }
+      .dock { padding: 0 10px 10px; padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+      .msg-bot { grid-template-columns: 1fr; gap: 8px; }
+      .bot-head { display: flex; align-items: center; gap: 10px; }
+      .bot-avatar { width: 28px; height: 28px; }
+      .bot-name { line-height: 28px; }
+      .two-col { grid-template-columns: 1fr; }
+      .verdict-block { flex-direction: column; gap: 14px; padding: 16px; }
+      .verdict-right { text-align: left; width: 100%; }
+      .conf-num { font-size: 32px; }
+      .result-body [style*="grid-template-columns"] { grid-template-columns: 1fr !important; }
+      .result-body [style*="repeat(auto-fill"], .result-body [style*="repeat(auto-fit"] { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)) !important; }
+      .source-item { white-space: normal; }
+      .src-row { flex-wrap: wrap; }
+      .src-rating { text-align: left; }
+      .news-slide { flex: 0 0 100%; }
+      .suggestions { justify-content: flex-start; flex-wrap: nowrap; overflow-x: auto; padding: 0 4px 4px; scrollbar-width: none; }
+      .sugg { white-space: nowrap; }
+      .attach-name { max-width: 22ch; }
+      .hero p { font-size: 15px; padding: 0 8px; }
+    }
+    @media (min-width: 681px) {
+      .bot-head { display: contents; }
+      .bot-head .bot-name { display: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+      .echo { display: none; }
     }
   </style>
 </head>
-<body>
+<body class="${hasResult ? "is-chat" : "is-home"}">
+<div class="app">
 
-<!-- LOADING -->
-<div id="loading-overlay" role="status" aria-live="polite">
-  <div class="loading-card">
-    <div class="loading-logo-text">Veri<span>facts</span></div>
-    <div class="loading-title">Verificando</div>
-    <div class="loading-sub">Detectando IA, checando fatos e notícias.</div>
-    <div class="l-steps">
-      <div class="l-step" id="ls1"><div class="l-dot"></div><span class="l-step-text">Extraindo alegação</span><span class="l-step-st" id="ls1s">—</span></div>
-      <div class="l-step" id="ls2"><div class="l-dot"></div><span class="l-step-text">Detecção de IA</span><span class="l-step-st" id="ls2s">—</span></div>
-      <div class="l-step" id="ls3"><div class="l-dot"></div><span class="l-step-text">Checagens de fatos</span><span class="l-step-st" id="ls3s">—</span></div>
-      <div class="l-step" id="ls4"><div class="l-dot"></div><span class="l-step-text">Notícias recentes</span><span class="l-step-st" id="ls4s">—</span></div>
-      <div class="l-step" id="ls5"><div class="l-dot"></div><span class="l-step-text">Relatório final</span><span class="l-step-st" id="ls5s">—</span></div>
-    </div>
-    <div class="loading-spinner"></div>
-  </div>
-</div>
-
-<!-- HEADER -->
-<header>
-  <div class="logo">Veri<span>facts</span></div>
-  ${userBar || `<div class="header-right">Verificação de Fatos + Detecção de IA</div>`}
-</header>
-
-<!-- BODY -->
-<div class="page-layout">
-
-  <!-- SIDEBAR: HISTÓRICO (por usuário, vem do servidor) -->
-  <aside class="sidebar">
-    <div class="sidebar-label">
-      <span>Histórico</span>
-      <button class="sidebar-clear" onclick="historyClearAll()">Limpar</button>
-    </div>
-    <div id="sidebar-body">
-      ${(() => {
-        if (!user) return `<div class="sidebar-empty">Nenhuma busca ainda.</div>`;
-        const items = getHistory(user.id);
-        if (!items.length) return `<div class="sidebar-empty">Nenhuma busca ainda.</div>`;
-        const V_COLORS = { provavelmente_falso: "var(--c-red)", suspeito: "var(--c-amber)", nao_verificado: "var(--c-blue)", provavelmente_verdadeiro: "var(--c-green)" };
-        return `<div class="sidebar-items">` + items.map(h => {
-          const label = h.text.length > 60 ? h.text.slice(0, 60) + "…" : h.text;
-          const dot = h.verdict && V_COLORS[h.verdict]
-            ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${V_COLORS[h.verdict]};margin-right:8px;flex-shrink:0;"></span>` : "";
-          // Com resultado salvo → reabre a verificação; sem → reusa o texto na busca
-          const btn = h.verdict
-            ? `<button class="sidebar-item-btn" title="${escapeHtml(h.text)}" onclick="location.href='/historico/ver/${h.id}'" style="display:flex;align-items:center;">${dot}<span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(label)}</span></button>`
-            : `<button class="sidebar-item-btn" title="${escapeHtml(h.text)}" data-text="${escapeHtml(h.text)}" onclick="historyUse(this)">${escapeHtml(label)}</button>`;
-          return `<div class="sidebar-item" data-hid="${h.id}">
-            ${btn}
-            <button class="sidebar-item-del" title="Remover" onclick="historyDel(${h.id}, this)">✕</button>
-          </div>`;
-        }).join("") + `</div>`;
-      })()}
-    </div>
-  </aside>
-
-  <!-- MAIN CONTENT -->
-  <div class="main">
-
-    <div class="sec-label">Submeter Conteúdo</div>
-
-    <div class="forms-grid">
-      <div class="form-panel">
-        <div class="panel-title">Texto ou Link</div>
-        <form method="post" action="/analyze-text" id="form-text">
-          <div class="field">
-            <label class="field-label"><span>Conteúdo</span><span id="char-count-content" class="muted">0 / 100</span></label>
-            <textarea class="fi" id="content" name="content" placeholder="Cole a afirmação, manchete ou URL que deseja verificar…" maxlength="100"></textarea>
-          </div>
-          <button class="btn" type="submit" id="btn-text">Verificar</button>
-          <div class="field-help">Máximo 100 caracteres.</div>
-        </form>
+  <!-- BARRA LATERAL -->
+  <aside class="sidebar" id="sidebar" aria-label="Histórico e conta">
+    <div class="side-top">
+      <div style="display:flex; align-items:center;">
+        <a class="brand" href="/" aria-label="Ecoa Saúde, início">${ecoaMark(30, "sb")}${ECOA_WORDMARK}</a>
+        <button class="icon-btn side-close" type="button" onclick="toggleSide(false)" aria-label="Fechar menu">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
       </div>
+      <a class="new-btn" href="/">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        Nova verificação
+      </a>
+    </div>
+    <div class="side-history">
+      <div class="sidebar-label">
+        <span>Recentes</span>
+        <button class="sidebar-clear" type="button" onclick="historyClearAll()">Limpar</button>
+      </div>
+      <div id="sidebar-body">${historyHtml}</div>
+    </div>
+    ${accountBlock}
+  </aside>
+  <div class="backdrop" onclick="toggleSide(false)"></div>
 
-      <div class="form-panel">
-        <div class="panel-title">Imagem ou Vídeo</div>
-        <form method="post" action="/analyze-file" enctype="multipart/form-data" id="form-file">
-          <div class="field">
-            <label class="field-label"><span>Contexto</span><span id="char-count-caption" class="muted">0 / 100</span></label>
-            <input class="fi" type="text" id="caption" name="caption" placeholder="Onde você recebeu? O que dizem que a mídia mostra?" maxlength="100">
+  <!-- PALCO -->
+  <main class="stage">
+    <div class="topbar">
+      <button class="icon-btn" type="button" onclick="toggleSide(true)" aria-label="Abrir menu">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+      </button>
+      <a class="brand" href="/">${ecoaMark(24, "tb")}${ECOA_WORDMARK}</a>
+      <span class="spacer"></span>
+      <a class="icon-btn" href="/" aria-label="Nova verificação">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      </a>
+    </div>
+
+    <div class="thread" id="thread">
+      <div class="thread-inner">
+
+        <section class="hero">
+          <div class="hero-mark">
+            <span class="echo"></span><span class="echo e2"></span>
+            ${ecoaMark(84, "hero")}
           </div>
-          <div class="field">
-            <label class="field-label">Arquivo</label>
-            <div class="file-zone">
-              <input type="file" id="file" name="file" accept="image/*,video/*" required>
-              <div class="file-zone-text">Clique para selecionar</div>
-              <div class="file-selected" id="fname"></div>
+          <h1>O que você quer verificar hoje?</h1>
+          <p>Mande uma frase, um link, uma foto ou um vídeo que recebeu. A gente checa nas fontes e te explica.</p>
+        </section>
+
+        <article class="msg-result msg-bot" aria-live="polite">
+          <div class="bot-head">
+            <div class="bot-avatar">${ecoaMark(24, "rs")}</div>
+            <div class="bot-name">Ecoa Saúde</div>
+          </div>
+          <div class="bot-body">
+            <div class="result-body">${content}</div>
+          </div>
+        </article>
+
+        <section class="pending" id="pending" hidden>
+          <div class="msg-user">
+            <div class="msg-user-file" id="pending-file" hidden>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+              <span id="pending-file-name"></span>
+            </div>
+            <div class="msg-user-text" id="pending-text"></div>
+          </div>
+          <div class="msg-bot" role="status" aria-live="polite">
+            <div class="bot-head">
+              <div class="bot-avatar">${ecoaMark(24, "pd", "thinking")}</div>
+              <div class="bot-name">Ecoa Saúde</div>
+            </div>
+            <div class="bot-body">
+              <div class="think-title">Checando isso para você…</div>
+              <div class="l-steps">
+                <div class="l-step" id="ls1"><span class="l-dot"></span>Entendendo a afirmação</div>
+                <div class="l-step" id="ls2"><span class="l-dot"></span>Procurando sinais de IA</div>
+                <div class="l-step" id="ls3"><span class="l-dot"></span>Consultando checagens de fatos</div>
+                <div class="l-step" id="ls4"><span class="l-dot"></span>Buscando notícias recentes</div>
+                <div class="l-step" id="ls5"><span class="l-dot"></span>Escrevendo a resposta</div>
+              </div>
             </div>
           </div>
-          <button class="btn" type="submit" id="btn-file">Analisar Mídia</button>
-          <div class="field-help">Ex.: print de post viral, foto que parece gerada por IA, vídeo recebido no WhatsApp · JPG, PNG ou MP4 até 80MB.</div>
-        </form>
+        </section>
+
       </div>
     </div>
 
-    <div class="sec-label" style="margin-top:32px;">Relatório</div>
+    <!-- COMPOSER -->
+    <div class="dock">
+      <form class="composer" id="composer" method="post" action="/analyze-text" enctype="application/x-www-form-urlencoded">
+        <div class="attach" id="attach" hidden>
+          <div class="attach-ico" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+          </div>
+          <div class="attach-txt">
+            <div class="attach-name" id="attach-name"></div>
+            <div class="attach-meta" id="attach-meta"></div>
+          </div>
+          <button class="icon-btn" type="button" id="attach-remove" aria-label="Remover arquivo">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
 
-    <div class="result-section">
-      <div class="result-section-head">Resultado da Verificação</div>
-      <div class="result-body">
-        ${content || `<div class="no-result">Nenhuma análise realizada. Envie um conteúdo acima ou clique em um dos exemplos para ver o relatório completo.</div>`}
+        <div class="composer-row">
+          <label class="c-btn" title="Anexar imagem ou vídeo" aria-label="Anexar imagem ou vídeo">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            <input type="file" id="file" name="file" accept="image/*,video/*">
+          </label>
+
+          <textarea id="content" name="content" rows="1" maxlength="100" placeholder="Pergunte qualquer coisa" aria-label="Mensagem para verificar" autocomplete="off"></textarea>
+
+          <span class="counter" id="counter" hidden>0/100</span>
+
+          <button class="c-btn" type="button" id="mic" title="Falar" aria-label="Ditar por voz" aria-pressed="false">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg>
+          </button>
+
+          <button class="send" type="submit" id="send" aria-label="Enviar" disabled>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M6 11l6-6 6 6"/></svg>
+          </button>
+        </div>
+      </form>
+
+      <div class="suggestions">
+        <button class="sugg" type="button" data-ex="Chá de boldo cura dengue?" onclick="fillExample(this)">Chá de boldo cura dengue?</button>
+        <button class="sugg" type="button" data-ex="A vacina da gripe pode causar gripe?" onclick="fillExample(this)">A vacina da gripe causa gripe?</button>
+        <button class="sugg" type="button" data-ex="Água com limão em jejum emagrece?" onclick="fillExample(this)">Água com limão em jejum emagrece?</button>
       </div>
+
+      <div class="dock-note" id="dock-note">A Ecoa Saúde pode errar. Confira as fontes antes de compartilhar.</div>
     </div>
-
-  </div><!-- /main -->
-
+  </main>
 </div>
-
-<!-- FOOTER -->
-<footer>
-  <div class="footer-logo">Veri<span>facts</span></div>
-  <div class="footer-note">Verificação baseada em fontes citadas e datadas · Consulte as fontes primárias antes de publicar</div>
-</footer>
 
 <script>
 (function(){
-  var contentInput = document.getElementById('content');
-  var charCountContent = document.getElementById('char-count-content');
-  var captionInput = document.getElementById('caption');
-  var charCountCaption = document.getElementById('char-count-caption');
-  
-  function updateContentCharCount() {
-    var chars = contentInput.value.length;
-    charCountContent.textContent = chars + ' / 100';
-    charCountContent.className = chars >= 100 ? 'char-warning' : 'muted';
+  var MAX = 100, MAX_BYTES = 80 * 1024 * 1024;
+  var body = document.body;
+  var form = document.getElementById('composer');
+  var ta = document.getElementById('content');
+  var fileInput = document.getElementById('file');
+  var attach = document.getElementById('attach');
+  var sendBtn = document.getElementById('send');
+  var counter = document.getElementById('counter');
+  var note = document.getElementById('dock-note');
+  var NOTE_DEFAULT = note.textContent;
+  var PH_TEXT = 'Pergunte qualquer coisa';
+  var PH_FILE = 'Onde você recebeu? O que dizem que mostra?';
+
+  function hasFile(){ return !!(fileInput.files && fileInput.files.length); }
+  function setNote(msg){ note.textContent = msg || NOTE_DEFAULT; note.classList.toggle('is-error', !!msg); }
+  function autosize(){ ta.style.height = '42px'; ta.style.height = Math.min(ta.scrollHeight, 168) + 'px'; }
+  function refresh(){
+    var n = ta.value.length;
+    counter.textContent = n + '/' + MAX;
+    counter.hidden = n < 70;
+    counter.classList.toggle('is-max', n >= MAX);
+    sendBtn.disabled = !(ta.value.trim() || hasFile());
+    autosize();
   }
+  function fmtSize(b){ return b > 1048576 ? (b / 1048576).toFixed(1).replace('.', ',') + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB'; }
 
-  function updateCaptionCharCount() {
-    var chars = captionInput.value.length;
-    charCountCaption.textContent = chars + ' / 100';
-    charCountCaption.className = chars >= 100 ? 'char-warning' : 'muted';
+  function showFile(){
+    if (!hasFile()) { attach.hidden = true; ta.placeholder = PH_TEXT; refresh(); return; }
+    var f = fileInput.files[0];
+    var okType = /^(image|video)[/]/.test(f.type || '');
+    if (!okType || f.size > MAX_BYTES) {
+      setNote(!okType ? 'Esse tipo de arquivo não é aceito. Envie uma imagem ou um vídeo.' : 'Arquivo muito grande. O máximo é 80 MB.');
+      fileInput.value = '';
+      attach.hidden = true; refresh(); return;
+    }
+    setNote('');
+    document.getElementById('attach-name').textContent = f.name;
+    document.getElementById('attach-meta').textContent = ((f.type || '').indexOf('video') === 0 ? 'Vídeo' : 'Imagem') + ', ' + fmtSize(f.size);
+    attach.hidden = false;
+    ta.placeholder = PH_FILE;
+    refresh();
+    ta.focus();
   }
+  fileInput.addEventListener('change', showFile);
+  document.getElementById('attach-remove').addEventListener('click', function(){ fileInput.value = ''; showFile(); });
 
-  contentInput.addEventListener('input', updateContentCharCount);
-  contentInput.addEventListener('change', updateContentCharCount);
-  captionInput.addEventListener('input', updateCaptionCharCount);
-  captionInput.addEventListener('change', updateCaptionCharCount);
-
-  // 🔴 [NOVO] Submeter formulário ao pressionar Enter
-  contentInput.addEventListener('keypress', function(e) {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      document.getElementById('form-text').submit();
+  // Arrastar e soltar arquivo na barra
+  ['dragenter','dragover'].forEach(function(ev){ form.addEventListener(ev, function(e){ e.preventDefault(); form.classList.add('is-drag'); }); });
+  ['dragleave','drop'].forEach(function(ev){ form.addEventListener(ev, function(e){ e.preventDefault(); form.classList.remove('is-drag'); }); });
+  form.addEventListener('drop', function(e){
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+      try { fileInput.files = e.dataTransfer.files; showFile(); } catch (err) {}
     }
   });
 
-  captionInput.addEventListener('keypress', function(e) {
-    if (e.key === 'Enter') {
+  ta.addEventListener('input', refresh);
+  ta.addEventListener('keydown', function(e){
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
-      document.getElementById('form-text').submit();
+      if (!sendBtn.disabled && prepare()) form.submit();
     }
   });
+  form.addEventListener('submit', function(e){ if (!prepare()) e.preventDefault(); });
 
-  document.getElementById('file').addEventListener('change', function(){
-    var el = document.getElementById('fname');
-    if (this.files && this.files[0]) { el.textContent = this.files[0].name; el.style.display='block'; }
-  });
+  // Um único campo: sem arquivo vai para /analyze-text, com arquivo vai para /analyze-file
+  function prepare(){
+    if (form.classList.contains('is-busy')) return false;
+    var text = ta.value.trim();
+    var f = hasFile() ? fileInput.files[0] : null;
+    if (!text && !f) return false;
+    if (f) {
+      form.action = '/analyze-file';
+      form.enctype = 'multipart/form-data';
+      ta.name = 'caption';
+      fileInput.disabled = false;
+    } else {
+      form.action = '/analyze-text';
+      form.enctype = 'application/x-www-form-urlencoded';
+      ta.name = 'content';
+      fileInput.disabled = true;
+    }
+    showPending(text, f ? f.name : '');
+    return true;
+  }
 
-  var overlay = document.getElementById('loading-overlay');
-  var steps = [
-    {el:document.getElementById('ls1'),st:document.getElementById('ls1s')},
-    {el:document.getElementById('ls2'),st:document.getElementById('ls2s')},
-    {el:document.getElementById('ls3'),st:document.getElementById('ls3s')},
-    {el:document.getElementById('ls4'),st:document.getElementById('ls4s')},
-    {el:document.getElementById('ls5'),st:document.getElementById('ls5s')},
-  ];
-  var delays = [0,2000,4000,7000,11000];
   var timers = [];
-  
-  function showLoading(){
-    timers.forEach(clearTimeout); timers=[];
-    steps.forEach(function(s){ s.el.classList.remove('active','done'); s.st.textContent='—'; });
-    overlay.classList.add('active');
-    document.body.style.overflow='hidden';
-    delays.forEach(function(d,i){
+  function showPending(text, fileName){
+    body.classList.remove('is-home');
+    body.classList.add('is-chat');
+    var result = document.querySelector('.msg-result');
+    if (result) result.hidden = true;
+    document.getElementById('pending-text').textContent = text;
+    document.getElementById('pending-file-name').textContent = fileName;
+    document.getElementById('pending-file').hidden = !fileName;
+    document.getElementById('pending').hidden = false;
+    form.classList.add('is-busy');
+    ta.readOnly = true;
+    setTimeout(function(){ sendBtn.disabled = true; }, 0);
+    toggleSide(false);
+
+    var steps = [1,2,3,4,5].map(function(i){ return document.getElementById('ls' + i); });
+    var delays = [0, 2000, 4000, 7000, 11000];
+    timers.forEach(clearTimeout); timers = [];
+    steps.forEach(function(s){ s.classList.remove('active','done'); });
+    delays.forEach(function(d, i){
       timers.push(setTimeout(function(){
-        if(i>0){ steps[i-1].el.classList.replace('active','done'); steps[i-1].st.textContent='OK'; }
-        steps[i].el.classList.add('active'); steps[i].st.textContent='...';
-      },d));
+        if (i > 0) { steps[i-1].classList.remove('active'); steps[i-1].classList.add('done'); }
+        steps[i].classList.add('active');
+      }, d));
+    });
+    var thread = document.getElementById('thread');
+    thread.scrollTop = 0;
+  }
+  function resetComposer(){
+    timers.forEach(clearTimeout);
+    form.classList.remove('is-busy');
+    ta.readOnly = false;
+    fileInput.disabled = false;
+    ta.name = 'content';
+    refresh();
+  }
+  window.addEventListener('pageshow', function(e){
+    if (e.persisted) {
+      document.getElementById('pending').hidden = true;
+      var result = document.querySelector('.msg-result');
+      if (result) result.hidden = false;
+      if (!result || !result.querySelector('.result-body').innerHTML.trim()) { body.classList.add('is-home'); body.classList.remove('is-chat'); }
+      resetComposer();
+    }
+  });
+
+  // Ditado por voz (quando o navegador suporta)
+  var mic = document.getElementById('mic');
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { mic.hidden = true; }
+  else {
+    var rec = null, live = false;
+    mic.addEventListener('click', function(){
+      if (live && rec) { rec.stop(); return; }
+      rec = new SR();
+      rec.lang = 'pt-BR';
+      rec.interimResults = true;
+      var base = ta.value.trim() ? ta.value.trim() + ' ' : '';
+      rec.onresult = function(ev){
+        var t = '';
+        for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
+        ta.value = (base + t).slice(0, MAX);
+        refresh();
+      };
+      rec.onend = rec.onerror = function(){
+        live = false; mic.classList.remove('is-live'); mic.setAttribute('aria-pressed', 'false');
+      };
+      try { rec.start(); live = true; mic.classList.add('is-live'); mic.setAttribute('aria-pressed', 'true'); } catch (err) {}
     });
   }
-  
-  function hideLoading(){
-    timers.forEach(clearTimeout);
-    overlay.classList.remove('active');
-    document.body.style.overflow='';
-  }
 
-  // 📜 Histórico por usuário — servidor (o antigo localStorage misturava contas)
-  window.fillExample = function(btn) {
-    var ta = document.getElementById('content');
-    ta.value = btn.getAttribute('data-ex') || '';
-    ta.dispatchEvent(new Event('input'));
+  // Menu lateral (celular)
+  window.toggleSide = function(open){ body.classList.toggle('side-open', !!open); };
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape') toggleSide(false); });
+
+  // Exemplos e histórico
+  window.fillExample = function(btn){
+    ta.value = (btn.getAttribute('data-ex') || '').slice(0, MAX);
+    refresh();
     ta.focus();
   };
-  window.historyUse = function(btn) {
-    var ta = document.getElementById('content');
-    ta.value = btn.getAttribute('data-text') || '';
+  window.historyUse = function(btn){
+    ta.value = (btn.getAttribute('data-text') || '').slice(0, MAX);
+    refresh();
+    toggleSide(false);
     ta.focus();
-    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
-  window.historyDel = function(id, btn) {
-    fetch('/historico/excluir', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: id }) })
-      .then(function(){ var el = btn.closest('.sidebar-item'); if (el) el.remove();
-        var body = document.getElementById('sidebar-body');
-        if (body && !body.querySelector('.sidebar-item')) body.innerHTML = '<div class="sidebar-empty">Nenhuma busca ainda.</div>';
+  var EMPTY_HIST = '<div class="sidebar-empty">Suas verificações aparecem aqui.</div>';
+  window.historyDel = function(id, btn){
+    fetch('/historico/excluir', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) })
+      .then(function(){
+        var el = btn.closest('.sidebar-item'); if (el) el.remove();
+        var hb = document.getElementById('sidebar-body');
+        if (hb && !hb.querySelector('.sidebar-item')) hb.innerHTML = EMPTY_HIST;
       }).catch(function(){});
   };
-  window.historyClearAll = function() {
-    fetch('/historico/limpar', { method:'POST' })
-      .then(function(){ document.getElementById('sidebar-body').innerHTML = '<div class="sidebar-empty">Nenhuma busca ainda.</div>'; })
+  window.historyClearAll = function(){
+    fetch('/historico/limpar', { method: 'POST' })
+      .then(function(){ document.getElementById('sidebar-body').innerHTML = EMPTY_HIST; })
       .catch(function(){});
   };
 
-  document.getElementById('form-text').addEventListener('submit', function(){
-    var val = document.getElementById('content').value.trim();
-    if (!val) return;
-    showLoading();
-    document.getElementById('btn-text').disabled=true;
-  });
-  document.getElementById('form-file').addEventListener('submit', function(e){
-    var f = document.getElementById('file').files[0];
-    if (!f) return;
-    showLoading();
-    document.getElementById('btn-file').disabled=true;
-  });
-  window.addEventListener('pageshow', function(e){
-    if(e.persisted){
-      hideLoading();
-      document.getElementById('btn-text').disabled=false;
-      document.getElementById('btn-file').disabled=false;
-    }
-  });
+  refresh();
+  if (body.classList.contains('is-home') && window.matchMedia('(min-width: 901px)').matches) ta.focus();
 
-
+  // Carrossel de notícias do relatório
   var _carouselIdx = 0;
-  function _visibleCount() {
-    var w = window.innerWidth;
-    if (w <= 560) return 1;
-    if (w <= 820) return 2;
+  function _visibleCount(){
+    var w = (document.querySelector('.carousel-viewport') || document.body).getBoundingClientRect().width;
+    if (w <= 520) return 1;
+    if (w <= 700) return 2;
     return 3;
   }
-
-  function newsGoTo(idx) {
+  function newsGoTo(idx){
     var track = document.getElementById('news-track');
     if (!track) return;
     var slides = track.querySelectorAll('.news-slide');
-    var dots   = document.querySelectorAll('#news-dots .c-dot');
+    var dots = document.querySelectorAll('#news-dots .c-dot');
     if (!slides.length) return;
-    var vis = _visibleCount();
-    var max = Math.max(0, slides.length - vis);
+    var max = Math.max(0, slides.length - _visibleCount());
     _carouselIdx = Math.max(0, Math.min(idx, max));
     var slideW = slides[0].getBoundingClientRect().width + 12;
     track.style.transform = 'translateX(-' + (_carouselIdx * slideW) + 'px)';
-    dots.forEach(function(d,i){ d.classList.toggle('active', i===_carouselIdx); });
+    dots.forEach(function(d, i){ d.classList.toggle('active', i === _carouselIdx); });
     var prev = document.getElementById('carousel-prev');
     var next = document.getElementById('carousel-next');
     if (prev) prev.disabled = _carouselIdx === 0;
     if (next) next.disabled = _carouselIdx >= max;
   }
-
-  function newsCarousel(dir) { newsGoTo(_carouselIdx + dir); }
-  window.newsGoTo     = newsGoTo;
-  window.newsCarousel = newsCarousel;
+  window.newsGoTo = newsGoTo;
+  window.newsCarousel = function(dir){ newsGoTo(_carouselIdx + dir); };
   setTimeout(function(){ newsGoTo(0); }, 50);
   window.addEventListener('resize', function(){ newsGoTo(_carouselIdx); });
 
@@ -3474,52 +2921,41 @@ function renderPage(content = "", user = null) {
     var track = document.getElementById('news-track');
     if (!track) return;
     var startX = 0, startIdx = 0, dragging = false, moved = false;
-
-    function onDown(e) {
+    function slideWidth(){ var s = track.querySelector('.news-slide'); return s ? s.getBoundingClientRect().width + 12 : 0; }
+    function onDown(e){
       dragging = true; moved = false;
       startX = e.type === 'mousedown' ? e.clientX : e.touches[0].clientX;
       startIdx = _carouselIdx;
       track.style.transition = 'none';
       track.style.cursor = 'grabbing';
     }
-    function onMove(e) {
+    function onMove(e){
       if (!dragging) return;
       var x = e.type === 'mousemove' ? e.clientX : e.touches[0].clientX;
       var diff = startX - x;
       if (Math.abs(diff) > 5) moved = true;
       if (!moved) return;
-      var slides = track.querySelectorAll('.news-slide');
-      if (!slides.length) return;
-      var slideW = slides[0].getBoundingClientRect().width + 12;
-      var offset = startIdx * slideW + diff;
-      track.style.transform = 'translateX(-' + offset + 'px)';
+      track.style.transform = 'translateX(-' + (startIdx * slideWidth() + diff) + 'px)';
       if (e.cancelable) e.preventDefault();
     }
-    function onUp(e) {
+    function onUp(e){
       if (!dragging) return;
       dragging = false;
       track.style.transition = '';
       track.style.cursor = 'grab';
       if (!moved) return;
-      var x = e.type === 'mouseup' ? e.clientX : (e.changedTouches[0]||{clientX:startX}).clientX;
-      var diff = startX - x;
-      var slides = track.querySelectorAll('.news-slide');
-      if (!slides.length) return;
-      var slideW = slides[0].getBoundingClientRect().width + 12;
-      var steps = Math.round(diff / slideW);
-      newsGoTo(startIdx + steps);
+      var x = e.type === 'mouseup' ? e.clientX : (e.changedTouches[0] || { clientX: startX }).clientX;
+      var w = slideWidth();
+      if (w) newsGoTo(startIdx + Math.round((startX - x) / w));
     }
-
     track.addEventListener('mousedown', onDown);
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
     track.addEventListener('touchstart', onDown, { passive: true });
     track.addEventListener('touchmove', onMove, { passive: false });
     track.addEventListener('touchend', onUp);
-
     track.style.cursor = 'grab';
   })();
-
 })();
 </script>
 </body>
@@ -3565,18 +3001,8 @@ app.post("/register", rateLimit(5, 30*60000), (req, res) => {
   }
   try {
     const id = createUser({ name, email, password });
-    // 🛡️ [ANTIFRAUDE] Se este e-mail já gastou teste grátis antes (mesmo em conta
-    // excluída), restaura o consumo — impede reset do trial via excluir/recriar.
-    const prior = getPriorTrialUsage(email);
-    if (prior > 0) {
-      db.prepare(`
-        INSERT INTO usage (user_id, month, count) VALUES (?, ?, ?)
-        ON CONFLICT(user_id, month) DO UPDATE SET count = MAX(count, excluded.count)
-      `).run(id, currentMonth(), prior);
-      console.log(`[Antifraude] ${email} recriou conta — trial restaurado: ${prior}/2 usados`);
-    }
     req.session.userId = id;
-    logActivity(id, email, "registro", prior > 0 ? `trial restaurado: ${prior}/2` : "conta nova", req); // 📋
+    logActivity(id, email, "registro", "conta nova", req); // 📋
     res.redirect("/");
   } catch (e) {
     console.error("Registro:", e.message);
@@ -3703,134 +3129,10 @@ app.post("/conta/excluir", requireAuth, async (req, res) => {
   if (!bcrypt.compareSync(password, full.password_hash)) {
     return res.redirect("/conta?erro=" + encodeURIComponent("Senha incorreta. Conta não excluída."));
   }
-  // 🔒 [FIX] Cancela a assinatura Stripe antes de excluir — senão o cliente
-  // continuaria sendo cobrado todo mês sem ter mais acesso!
-  if (stripe && full.stripe_subscription_id) {
-    try {
-      await stripe.subscriptions.cancel(full.stripe_subscription_id);
-      console.log(`[Stripe] Assinatura ${full.stripe_subscription_id} cancelada (exclusão de conta)`);
-    } catch (e) {
-      console.error("[Stripe] Falha ao cancelar assinatura na exclusão:", e.message);
-    }
-  }
-  // 🛡️ [ANTIFRAUDE] Registra quanto do teste grátis foi usado ANTES de excluir.
-  // Se recriar a conta com o mesmo e-mail, o trial continua de onde parou.
-  recordTrialUsage(full.email, Math.min(getTotalUsage(req.user.id), 2));
   logActivity(req.user.id, req.user.email, "conta_excluida", "auto-exclusão pelo usuário", req); // 📋
   console.log(`[Conta] Exclusão: ${req.user.email} (id ${req.user.id})`);
   deleteUser(req.user.id);
-  req.session.destroy(() => res.redirect("/login?msg=" + encodeURIComponent("Conta excluída com sucesso. Assinaturas foram canceladas.")));
-});
-
-// ══════════════════════════════════════════════════════════
-// 💳 ROTAS: PAGAMENTO STRIPE
-// ══════════════════════════════════════════════════════════
-const PLAN_PRICES_BRL = { starter: 12990, profissional: 33990 }; // centavos
-
-// Criar sessão de checkout (assinatura mensal)
-app.post("/planos/checkout", requireAuth, async (req, res) => {
-  if (!stripe) return res.redirect("/planos?erro=" + encodeURIComponent("Pagamentos ainda não configurados. Contate o suporte."));
-  const plan = String(req.body.plan || "");
-  if (!PLAN_PRICES_BRL[plan]) return res.redirect("/planos?erro=" + encodeURIComponent("Plano inválido."));
-  // 🔒 [FIX] Já tem assinatura ativa? Bloqueia 2º checkout (evita cobrança dupla).
-  // Troca de plano deve ser feita pelo portal (que faz upgrade/downgrade na mesma assinatura).
-  if (req.user.stripe_subscription_id) {
-    return res.redirect("/planos?erro=" + encodeURIComponent("Você já tem uma assinatura ativa. Use o botão 'Gerenciar assinatura' para trocar de plano ou cancelar."));
-  }
-  try {
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      client_reference_id: String(req.user.id),
-      // Reusa o customer se já assinou antes; senão preenche o e-mail
-      ...(req.user.stripe_customer_id
-        ? { customer: req.user.stripe_customer_id }
-        : { customer_email: req.user.email }),
-      metadata: { plan, userId: String(req.user.id) },
-      subscription_data: { metadata: { plan, userId: String(req.user.id) } },
-      line_items: [{
-        quantity: 1,
-        price_data: {
-          currency: "brl",
-          unit_amount: PLAN_PRICES_BRL[plan],
-          recurring: { interval: "month" },
-          product_data: {
-            name: `Verifacts ${PLANS[plan].name}`,
-            description: plan === "starter" ? "100 verificações/mês" : "1.000 verificações/mês"
-          }
-        }
-      }],
-      success_url: `${CONFIG.APP_URL}/planos/sucesso?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${CONFIG.APP_URL}/planos?erro=` + encodeURIComponent("Pagamento cancelado. Nenhuma cobrança foi feita.")
-    });
-    res.redirect(303, session.url);
-  } catch (e) {
-    console.error("[Stripe] Checkout:", e.message);
-    res.redirect("/planos?erro=" + encodeURIComponent("Erro ao iniciar pagamento: " + e.message));
-  }
-});
-
-// Retorno do checkout: confirma e ativa o plano na hora (webhook é o backup)
-app.get("/planos/sucesso", requireAuth, async (req, res) => {
-  if (stripe && req.query.session_id) {
-    try {
-      const s = await stripe.checkout.sessions.retrieve(String(req.query.session_id));
-      const paid = s && (s.payment_status === "paid" || s.status === "complete");
-      const mine = String(s?.client_reference_id) === String(req.user.id);
-      const plan = s?.metadata?.plan;
-      if (paid && mine && PLAN_PRICES_BRL[plan]) {
-        updateUserPlan(req.user.id, plan);
-        setUserStripe(req.user.id, s.customer, s.subscription);
-        logActivity(req.user.id, req.user.email, "assinatura_ativada", `plano ${plan} via Stripe Checkout`, req); // 📋
-        console.log(`[Stripe] ✓ Plano ativado no retorno: ${req.user.email} → ${plan}`);
-      }
-    } catch (e) {
-      console.error("[Stripe] Sucesso:", e.message);
-    }
-  }
-  res.redirect("/planos?ok=pagamento");
-});
-
-// Portal de assinatura (trocar cartão, ver faturas, cancelar)
-app.post("/planos/portal", requireAuth, async (req, res) => {
-  if (!stripe || !req.user.stripe_customer_id) {
-    return res.redirect("/planos?erro=" + encodeURIComponent("Você não possui uma assinatura ativa."));
-  }
-  try {
-    const portal = await stripe.billingPortal.sessions.create({
-      customer: req.user.stripe_customer_id,
-      return_url: `${CONFIG.APP_URL}/planos`
-    });
-    res.redirect(303, portal.url);
-  } catch (e) {
-    console.error("[Stripe] Portal:", e.message);
-    res.redirect("/planos?erro=" + encodeURIComponent("Erro ao abrir portal: " + e.message));
-  }
-});
-
-// ══════════════════════════════════════════════════════════
-// ⚙️ ROTAS: PLANOS (mudança de plano)
-// ══════════════════════════════════════════════════════════
-app.get("/planos", requireAuth, (req, res) => {
-  res.send(renderPlanosPage(req.user, req.query));
-});
-
-app.post("/planos/mudar", requireAuth, (req, res) => {
-  // 💳 Com Stripe ativo, planos pagos exigem pagamento — troca manual desabilitada
-  if (stripe) {
-    return res.redirect("/planos?erro=" + encodeURIComponent("Use o botão Assinar para contratar com pagamento seguro."));
-  }
-  const plan = String(req.body.plan || "");
-  // Institucional só via contato comercial (evita auto-upgrade para ilimitado)
-  if (!["pessoal", "starter", "profissional"].includes(plan)) {
-    return res.redirect("/planos?erro=" + encodeURIComponent("Este plano não pode ser selecionado. O Grátis é apenas para novas contas; para o Institucional, fale com vendas."));
-  }
-  if (plan === req.user.plan) {
-    return res.redirect("/planos?erro=" + encodeURIComponent("Você já está neste plano."));
-  }
-  updateUserPlan(req.user.id, plan);
-  logActivity(req.user.id, req.user.email, "plano_alterado", `${req.user.plan} → ${plan} (manual)`, req); // 📋
-  console.log(`[Planos] ${req.user.email} mudou de ${req.user.plan} → ${plan}`);
-  res.redirect("/planos?ok=1");
+  req.session.destroy(() => res.redirect("/login?msg=" + encodeURIComponent("Conta excluída com sucesso.")));
 });
 
 // ══════════════════════════════════════════════════════════
@@ -3838,7 +3140,7 @@ app.post("/planos/mudar", requireAuth, (req, res) => {
 // ══════════════════════════════════════════════════════════
 app.get("/", requireAuth, async (req, res) => res.send(renderPage("", req.user)));
 
-app.post("/analyze-text", requireAuth, checkUsageLimit, async (req, res) => {
+app.post("/analyze-text", requireAuth, async (req, res) => {
   try {
     const content = (req.body.content||"").trim();
     if (!content) return res.send(renderPage(`<div class="no-result">Envie algum texto ou link.</div>`, req.user));
@@ -3866,7 +3168,7 @@ function uploadSafe(req, res, next) {
   });
 }
 
-app.post("/analyze-file", requireAuth, checkUsageLimit, uploadSafe, async (req, res) => {
+app.post("/analyze-file", requireAuth, uploadSafe, async (req, res) => {
   let filePath = req.file?.path;
   try {
     if (!req.file) return res.send(renderPage(`<div class="no-result">Nenhum arquivo enviado.</div>`, req.user));
@@ -3923,7 +3225,7 @@ app.get("/admin", requireAuth, requireAdmin, (req, res) => {
   let users;
   if (q) {
     users = db.prepare(`
-      SELECT u.id, u.name, u.email, u.plan, u.created_at, u.stripe_subscription_id,
+      SELECT u.id, u.name, u.email, u.created_at,
              COALESCE(m.count, 0) AS month_usage,
              COALESCE(t.total, 0) AS total_usage
       FROM users u
@@ -3934,7 +3236,7 @@ app.get("/admin", requireAuth, requireAdmin, (req, res) => {
     `).all(currentMonth(), `%${q}%`, `%${q}%`);
   } else {
     users = db.prepare(`
-      SELECT u.id, u.name, u.email, u.plan, u.created_at, u.stripe_subscription_id,
+      SELECT u.id, u.name, u.email, u.created_at,
              COALESCE(m.count, 0) AS month_usage,
              COALESCE(t.total, 0) AS total_usage
       FROM users u
@@ -3945,45 +3247,31 @@ app.get("/admin", requireAuth, requireAdmin, (req, res) => {
   }
   const stats = {
     total: db.prepare("SELECT COUNT(*) c FROM users").get().c,
-    pagantes: db.prepare("SELECT COUNT(*) c FROM users WHERE plan IN ('starter','profissional','institucional')").get().c,
-    assinaturas: db.prepare("SELECT COUNT(*) c FROM users WHERE stripe_subscription_id IS NOT NULL").get().c,
     verifMes: db.prepare("SELECT COALESCE(SUM(count),0) c FROM usage WHERE month = ?").get(currentMonth()).c,
     verifHoje: db.prepare("SELECT COUNT(*) c FROM activity_log WHERE action = 'verificacao' AND created_at >= ?").get(new Date().toISOString().slice(0,10)).c,
-    trials: db.prepare("SELECT COUNT(*) c FROM trial_registry").get().c
+    verifTotal: db.prepare("SELECT COALESCE(SUM(count),0) c FROM usage").get().c,
+    pesquisas: db.prepare("SELECT COUNT(*) c FROM history").get().c
   };
   let msg = "";
-  if (req.query.ok === "plano") msg = `<div class="msg-ok">✓ Plano do usuário alterado.</div>`;
-  if (req.query.ok === "excluido") msg = `<div class="msg-ok">✓ Usuário excluído (sem registro antifraude — pode recriar com trial cheio).</div>`;
+  if (req.query.ok === "excluido") msg = `<div class="msg-ok">✓ Usuário excluído.</div>`;
   if (req.query.erro) msg = `<div class="msg-err">${escapeHtml(req.query.erro)}</div>`;
   if (req.query.pushsent) msg = `<div class="msg-ok">🔔 Notificação disparada: ${escapeHtml(req.query.pushsent)}</div>`;
 
-  const planOptions = (current) => Object.entries(PLANS).map(([k, p]) =>
-    `<option value="${k}" ${k === current ? "selected" : ""}>${p.name}</option>`).join("");
-
-  const td = `padding:9px 8px; border-top:1px solid #222; vertical-align:middle;`;
+  const td = `padding:9px 8px; border-top:1px solid #E6E8EC; vertical-align:middle;`;
   const rows = users.map(u => `
     <tr>
-      <td style="${td} color:#666;">#${u.id}</td>
-      <td style="${td} color:#f0f0f0; white-space:nowrap;">${escapeHtml(u.name)}${isAdmin(u) ? ' <span style="color:#FFD700;">👑</span>' : ''}</td>
+      <td style="${td} color:#6B7280;">#${u.id}</td>
+      <td style="${td} color:#14171C; white-space:nowrap;">${escapeHtml(u.name)}${isAdmin(u) ? ' <span style="color:#9A7400;">👑</span>' : ''}</td>
       <td style="${td}">${escapeHtml(u.email)}</td>
-      <td style="${td} white-space:nowrap;">
-        <form method="post" action="/admin/plano" style="display:flex; gap:6px; align-items:center;">
-          <input type="hidden" name="user_id" value="${u.id}">
-          <select name="plan" style="background:#181818; border:1px solid #2e2e2e; color:#ccc; padding:5px 8px; border-radius:2px; font-size:12px;">
-            ${planOptions(u.plan)}
-          </select>
-          <button type="submit" style="background:#2a2a2a; border:1px solid #3a3a3a; color:#5b9bd5; padding:5px 10px; border-radius:2px; font-size:11px; cursor:pointer; font-weight:600;">Salvar</button>
-          ${u.stripe_subscription_id ? '<span title="Tem assinatura Stripe ativa">💳</span>' : ''}
-        </form>
-      </td>
       <td style="${td} text-align:right;">${u.month_usage}</td>
-      <td style="${td} text-align:right; color:#666;">${u.total_usage}</td>
-      <td style="${td} color:#666; font-size:12px; white-space:nowrap;">${new Date(u.created_at).toLocaleDateString("pt-BR")}</td>
+      <td style="${td} text-align:right; color:#6B7280;">${u.total_usage}</td>
+      <td style="${td} color:#6B7280; font-size:12px; white-space:nowrap;">${new Date(u.created_at).toLocaleDateString("pt-BR")}</td>
       <td style="${td} white-space:nowrap;">
-        <a href="/admin/logs?email=${encodeURIComponent(u.email)}" style="color:#5b9bd5; font-size:12px; margin-right:10px;">Logs</a>
-        <form method="post" action="/admin/excluir" style="display:inline;" onsubmit="return confirm('Excluir ${escapeHtml(u.email)}? (exclusão de teste: sem registro antifraude)');">
+        <a href="/admin/exportar/usuario/${u.id}" style="color:#2560CC; font-size:12px; margin-right:10px;">Baixar</a>
+        <a href="/admin/logs?email=${encodeURIComponent(u.email)}" style="color:#2560CC; font-size:12px; margin-right:10px;">Logs</a>
+        <form method="post" action="/admin/excluir" style="display:inline;" onsubmit="return confirm('Excluir ${escapeHtml(u.email)}? Esta ação apaga a conta e todo o histórico dela.');">
           <input type="hidden" name="user_id" value="${u.id}">
-          <button type="submit" style="background:none; border:none; color:#e53935; font-size:12px; cursor:pointer; padding:0;">Excluir</button>
+          <button type="submit" style="background:none; border:none; color:#C62828; font-size:12px; cursor:pointer; padding:0;">Excluir</button>
         </form>
       </td>
     </tr>`).join("");
@@ -3991,89 +3279,98 @@ app.get("/admin", requireAuth, requireAdmin, (req, res) => {
   const pushDevices = db.prepare("SELECT COUNT(*) AS c FROM push_tokens").get().c;
   const content = `
   <div class="page-title">👑 Admin</div>
-  <div class="page-sub">Gestão de clientes, planos e atividades. <a href="/admin/logs" style="color:#5b9bd5;">Ver todos os logs →</a></div>
+  <div class="page-sub">Gestão de usuários, dados e atividades. <a href="/admin/logs" style="color:#2560CC;">Ver todos os logs →</a></div>
   ${msg}
   <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-bottom:24px;">
-    ${[["Contas", stats.total],["Planos pagos", stats.pagantes],["Assinaturas 💳", stats.assinaturas],["Verif. no mês", stats.verifMes],["Verif. hoje", stats.verifHoje],["Trials usados", stats.trials],["Aparelhos 🔔", pushDevices]].map(([label,val]) => `
+    ${[["Contas", stats.total],["Verif. no mês", stats.verifMes],["Verif. hoje", stats.verifHoje],["Verif. no total", stats.verifTotal],["Pesquisas salvas", stats.pesquisas],["Aparelhos 🔔", pushDevices]].map(([label,val]) => `
     <div class="card" style="margin:0; padding:16px; text-align:center;">
-      <div style="font-family:'Barlow Condensed',sans-serif; font-size:28px; font-weight:700; color:#5b9bd5;">${val}</div>
-      <div style="font-size:11px; color:#666; text-transform:uppercase; letter-spacing:0.06em;">${label}</div>
+      <div style="font-size:28px; font-weight:700; color:#2560CC;">${val}</div>
+      <div style="font-size:11px; color:#6B7280; text-transform:uppercase; letter-spacing:0.06em;">${label}</div>
     </div>`).join("")}
+  </div>
+
+  <!-- 📥 EXPORTAÇÃO DE DADOS -->
+  <div class="card" style="margin-bottom:24px;">
+    <div class="card-title">📥 Baixar dados</div>
+    <div style="color:#6B7280; font-size:14px; margin-bottom:16px;">
+      Os arquivos CSV abrem direto no Excel ou no Google Planilhas. O JSON traz tudo junto, para backup ou análise.
+      O histórico guarda as ${MAX_HISTORY_PER_USER} pesquisas mais recentes de cada usuário.
+    </div>
+    <div style="display:flex; flex-wrap:wrap; gap:10px;">
+      <a class="btn" href="/admin/exportar/usuarios" style="text-decoration:none; display:inline-block;">Usuários (CSV)</a>
+      <a class="btn" href="/admin/exportar/pesquisas" style="text-decoration:none; display:inline-block;">Pesquisas (CSV)</a>
+      <a class="btn" href="/admin/exportar/logs" style="text-decoration:none; display:inline-block;">Logs (CSV)</a>
+      <a class="btn" href="/admin/exportar/tudo" style="text-decoration:none; display:inline-block; background:#0F1217;">Tudo (JSON)</a>
+      <a class="btn" href="/admin/exportar/tudo?completo=1" style="text-decoration:none; display:inline-block; background:transparent; color:#2560CC; border:1px solid #2560CC;">Tudo + relatórios completos (JSON)</a>
+    </div>
   </div>
 
   <!-- 🔔 DISPARADOR DE NOTIFICAÇÕES -->
   <div class="card" style="margin-bottom:24px;">
-    <div style="font-family:'Barlow Condensed',sans-serif; font-size:18px; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">🔔 Disparar notificação</div>
-    <div style="color:#888; font-size:14px; margin-bottom:14px;">Envia push para os aparelhos com o app instalado (${pushDevices} registrado${pushDevices === 1 ? "" : "s"}).</div>
-    <form method="post" action="/admin/notificacoes" style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+    <div style="font-size:18px; font-weight:700; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">🔔 Disparar notificação</div>
+    <div style="color:#6B7280; font-size:14px; margin-bottom:14px;">Envia push para os aparelhos com o app instalado (${pushDevices} registrado${pushDevices === 1 ? "" : "s"}).</div>
+    <form method="post" action="/admin/notificacoes" style="display:grid; grid-template-columns:1fr; gap:12px;">
       <input type="hidden" name="back" value="admin">
       <div style="grid-column:1 / -1;">
         <input name="title" maxlength="80" required placeholder="Título (ex.: Nova checagem em destaque)"
-          style="width:100%; background:#111; border:1px solid #222; color:#f0f0f0; font-family:inherit; font-size:15px; padding:10px 12px; border-radius:2px;">
+          style="width:100%; background:#F4F6F9; border:1px solid #E6E8EC; color:#14171C; font-family:inherit; font-size:15px; padding:10px 12px; border-radius:2px;">
       </div>
       <div style="grid-column:1 / -1;">
         <textarea name="body" maxlength="220" required placeholder="Mensagem (até 220 caracteres)"
-          style="width:100%; min-height:70px; resize:vertical; background:#111; border:1px solid #222; color:#f0f0f0; font-family:inherit; font-size:15px; padding:10px 12px; border-radius:2px;"></textarea>
+          style="width:100%; min-height:70px; resize:vertical; background:#F4F6F9; border:1px solid #E6E8EC; color:#14171C; font-family:inherit; font-size:15px; padding:10px 12px; border-radius:2px;"></textarea>
       </div>
-      <select name="plan" style="background:#111; border:1px solid #222; color:#f0f0f0; font-family:inherit; font-size:15px; padding:10px 12px; border-radius:2px;">
-        <option value="">Todos os usuários</option>
-        ${Object.keys(PLANS).map(p => `<option value="${p}">${PLANS[p].name}</option>`).join("")}
-      </select>
-      <button type="submit" style="background:#e53935; color:#fff; border:0; padding:12px; font-family:inherit; font-size:14px; font-weight:700; text-transform:uppercase; letter-spacing:2px; cursor:pointer; border-radius:2px;">Disparar</button>
+      <button type="submit" style="background:#C62828; color:#FFFFFF; border:0; padding:12px; font-family:inherit; font-size:14px; font-weight:700; text-transform:uppercase; letter-spacing:2px; cursor:pointer; border-radius:2px;">Disparar</button>
     </form>
   </div>
   <div class="card" style="overflow-x:auto;">
     <div class="card-title" style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
-      <span>Clientes ${q ? `— busca: "${escapeHtml(q)}" (${users.length})` : `(${users.length})`}</span>
+      <span>Usuários ${q ? `— busca: "${escapeHtml(q)}" (${users.length})` : `(${users.length})`}</span>
       <form method="get" action="/admin" style="display:flex; gap:6px;">
-        <input type="text" name="q" value="${escapeHtml(q)}" placeholder="Buscar nome ou e-mail..." style="background:#181818; border:1px solid #2e2e2e; color:#f0f0f0; padding:7px 12px; border-radius:2px; font-size:13px; width:220px;">
-        <button type="submit" style="background:#2a2a2a; border:1px solid #3a3a3a; color:#ccc; padding:7px 14px; border-radius:2px; font-size:12px; cursor:pointer;">Buscar</button>
-        ${q ? '<a href="/admin" style="align-self:center; color:#666; font-size:12px;">limpar</a>' : ''}
+        <input type="text" name="q" value="${escapeHtml(q)}" placeholder="Buscar nome ou e-mail..." style="background:#F4F6F9; border:1px solid #E3E6EB; color:#14171C; padding:7px 12px; border-radius:2px; font-size:13px; width:220px;">
+        <button type="submit" style="background:#EEF1F5; border:1px solid #D5D9E0; color:#3F4652; padding:7px 14px; border-radius:2px; font-size:12px; cursor:pointer;">Buscar</button>
+        ${q ? '<a href="/admin" style="align-self:center; color:#6B7280; font-size:12px;">limpar</a>' : ''}
       </form>
     </div>
     <table style="width:100%; border-collapse:collapse; font-size:13px;">
       <thead>
-        <tr style="color:#555; text-transform:uppercase; font-size:11px; letter-spacing:0.08em; text-align:left;">
-          <th style="padding:8px;">ID</th><th style="padding:8px;">Nome</th><th style="padding:8px;">E-mail</th><th style="padding:8px;">Plano</th><th style="padding:8px; text-align:right;">Mês</th><th style="padding:8px; text-align:right;">Total</th><th style="padding:8px;">Criada</th><th style="padding:8px;">Ações</th>
+        <tr style="color:#6B7280; text-transform:uppercase; font-size:11px; letter-spacing:0.08em; text-align:left;">
+          <th style="padding:8px;">ID</th><th style="padding:8px;">Nome</th><th style="padding:8px;">E-mail</th><th style="padding:8px; text-align:right;">Mês</th><th style="padding:8px; text-align:right;">Total</th><th style="padding:8px;">Criada</th><th style="padding:8px;">Ações</th>
         </tr>
       </thead>
-      <tbody style="color:#aaa;">${rows || `<tr><td colspan="8" style="padding:20px; text-align:center; color:#555;">Nenhum usuário encontrado.</td></tr>`}</tbody>
+      <tbody style="color:#4A5260;">${rows || `<tr><td colspan="7" style="padding:20px; text-align:center; color:#6B7280;">Nenhum usuário encontrado.</td></tr>`}</tbody>
     </table>
   </div>`;
   res.send(renderSubPage("Admin", content, req.user));
 });
 
-// 👑 Alterar plano de qualquer usuário pelo painel
 // 🔔 [NOVO] Disparador de notificações (admin)
 app.get("/admin/notificacoes", requireAuth, requireAdmin, (req, res) => {
   const total = db.prepare("SELECT COUNT(*) AS c FROM push_tokens").get().c;
-  const byPlan = db.prepare(`SELECT u.plan, COUNT(*) AS c FROM push_tokens p
-    JOIN users u ON u.id = p.user_id GROUP BY u.plan`).all();
   const sent = String(req.query.sent || "");
   res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Notificações — Verifacts Admin</title>
+  <title>Notificações — Ecoa Saúde Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
-    :root { --bg:#0a0a0a; --card:#181818; --line:#222; --dim:#888; --fg:#f0f0f0; --red:#e53935; }
+    :root { --bg:#FFFFFF; --card:#F6F7F9; --line:#E6E8EC; --dim:#6B7280; --fg:#14171C; --red:#C62828; }
     * { box-sizing:border-box; margin:0; }
-    body { background:var(--bg); color:var(--fg); font-family:'Barlow Condensed',sans-serif; padding:32px 16px; }
+    body { background:var(--bg); color:var(--fg); padding:32px 16px; }
     .wrap { max-width:560px; margin:0 auto; }
     h1 { font-size:30px; text-transform:uppercase; letter-spacing:1px; }
     h1 span { color:var(--red); }
     .meta { color:var(--dim); margin:8px 0 24px; font-size:16px; }
     .card { background:var(--card); border:1px solid var(--line); padding:20px; }
     label { display:block; font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--dim); margin:14px 0 6px; }
-    input, textarea, select { width:100%; background:#111; border:1px solid var(--line); color:var(--fg);
+    input, textarea, select { width:100%; background:#F4F6F9; border:1px solid var(--line); color:var(--fg);
       font-family:inherit; font-size:17px; padding:10px 12px; border-radius:2px; }
     textarea { min-height:90px; resize:vertical; }
-    button { margin-top:20px; width:100%; background:var(--red); color:#fff; border:0; padding:14px;
+    button { margin-top:20px; width:100%; background:var(--red); color:#FFFFFF; border:0; padding:14px;
       font-family:inherit; font-size:16px; font-weight:700; text-transform:uppercase; letter-spacing:2px; cursor:pointer; border-radius:2px; }
-    .ok { background:#12261a; border:1px solid #43a047; color:#a5d6a7; padding:12px; margin-bottom:16px; font-size:15px; }
+    .ok { background:#E8F5EE; border:1px solid #2E8B57; color:#2E8B57; padding:12px; margin-bottom:16px; font-size:15px; }
     a { color:var(--dim); font-size:14px; }
   </style></head><body><div class="wrap">
-    <h1>VERI<span>FACTS</span> — Notificações</h1>
-    <div class="meta">${total} aparelho(s) registrados${byPlan.length ? " · " + byPlan.map(b => `${b.plan}: ${b.c}`).join(" · ") : ""}</div>
+    <h1>Ecoa Saúde — Notificações</h1>
+    <div class="meta">${total} aparelho(s) registrados</div>
     ${sent ? `<div class="ok">✓ Disparo concluído: ${escapeHtml(sent)}</div>` : ""}
     <div class="card">
       <form method="post" action="/admin/notificacoes">
@@ -4081,12 +3378,7 @@ app.get("/admin/notificacoes", requireAuth, requireAdmin, (req, res) => {
         <input name="title" maxlength="80" required placeholder="Ex.: Nova checagem em destaque">
         <label>Mensagem</label>
         <textarea name="body" maxlength="220" required placeholder="Ex.: O boato sobre X foi verificado. Abra e veja as fontes."></textarea>
-        <label>Destinatários</label>
-        <select name="plan">
-          <option value="">Todos os usuários</option>
-          ${Object.keys(PLANS).map(p => `<option value="${p}">${PLANS[p].name}</option>`).join("")}
-        </select>
-        <button type="submit">Disparar notificação</button>
+        <button type="submit">Disparar notificação para todos</button>
       </form>
     </div>
     <p style="margin-top:16px;"><a href="/admin">← Voltar ao painel</a></p>
@@ -4096,46 +3388,28 @@ app.get("/admin/notificacoes", requireAuth, requireAdmin, (req, res) => {
 app.post("/admin/notificacoes", requireAuth, requireAdmin, async (req, res) => {
   const title = String(req.body?.title || "").trim().slice(0, 80);
   const body = String(req.body?.body || "").trim().slice(0, 220);
-  const plan = String(req.body?.plan || "").trim();
   if (!title || !body) return res.redirect("/admin/notificacoes");
 
-  const rows = plan
-    ? db.prepare(`SELECT p.token FROM push_tokens p JOIN users u ON u.id = p.user_id WHERE u.plan = ?`).all(plan)
-    : db.prepare("SELECT token FROM push_tokens").all();
+  const rows = db.prepare("SELECT token FROM push_tokens").all();
 
   const messages = rows.map(r => ({
     to: r.token, sound: "default", title, body,
     data: { source: "verifacts-admin" }
   }));
   const result = messages.length ? await sendExpoPush(messages) : { ok: 0, fail: 0 };
-  logActivity(req.user.id, req.user.email, "push_admin", `"${title}" → ${plan || "todos"}: ${result.ok} ok, ${result.fail} falhas`, req);
+  logActivity(req.user.id, req.user.email, "push_admin", `"${title}" → todos: ${result.ok} ok, ${result.fail} falhas`, req);
   const report = `${result.ok} enviada(s), ${result.fail} falha(s)`;
   if (req.body?.back === "admin") return res.redirect("/admin?pushsent=" + encodeURIComponent(report));
   res.redirect("/admin/notificacoes?sent=" + encodeURIComponent(report));
 });
 
-app.post("/admin/plano", requireAuth, requireAdmin, (req, res) => {
-  const userId = Number(req.body.user_id);
-  const plan = String(req.body.plan || "");
-  const target = findUserById(userId);
-  if (!target || !PLANS[plan]) return res.redirect("/admin?erro=" + encodeURIComponent("Usuário ou plano inválido."));
-  const anterior = target.plan;
-  updateUserPlan(userId, plan);
-  logActivity(userId, target.email, "admin_plano_alterado", `${anterior} → ${plan} (por ${req.user.email})`, req);
-  console.log(`[Admin] ${req.user.email} alterou plano de ${target.email}: ${anterior} → ${plan}`);
-  res.redirect("/admin?ok=plano");
-});
-
-// 👑 Excluir usuário pelo painel (exclusão LIMPA para testes: sem registro antifraude)
+// 👑 Excluir usuário pelo painel
 app.post("/admin/excluir", requireAuth, requireAdmin, async (req, res) => {
   const userId = Number(req.body.user_id);
   if (userId === req.user.id) return res.redirect("/admin?erro=" + encodeURIComponent("Você não pode excluir a própria conta pelo painel."));
   const target = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
   if (!target) return res.redirect("/admin?erro=" + encodeURIComponent("Usuário não encontrado."));
-  if (stripe && target.stripe_subscription_id) {
-    try { await stripe.subscriptions.cancel(target.stripe_subscription_id); } catch (e) { console.error("[Admin] Cancelar sub:", e.message); }
-  }
-  logActivity(userId, target.email, "admin_conta_excluida", `por ${req.user.email} (sem antifraude)`, req);
+  logActivity(userId, target.email, "admin_conta_excluida", `por ${req.user.email}`, req);
   deleteUser(userId);
   db.prepare("DELETE FROM sessions WHERE sess LIKE ?").run(`%"userId":${userId}%`); // derruba sessões ativas do excluído
   console.log(`[Admin] ${req.user.email} excluiu ${target.email}`);
@@ -4156,70 +3430,251 @@ app.get("/admin/logs", requireAuth, requireAdmin, (req, res) => {
   const actions = db.prepare("SELECT DISTINCT action FROM activity_log ORDER BY action").all().map(r => r.action);
 
   const badgeColor = (a) => {
-    if (a === "verificacao") return "#5b9bd5";
-    if (a === "login" || a === "registro") return "#43a047";
-    if (a.includes("falhou") || a.includes("excluida")) return "#e53935";
+    if (a === "verificacao") return "#2560CC";
+    if (a === "login" || a === "registro") return "#2E8B57";
+    if (a.includes("falhou") || a.includes("excluida")) return "#C62828";
     if (a.includes("plano") || a.includes("assinatura")) return "#9c6bff";
     return "#888";
   };
-  const td = `padding:8px; border-top:1px solid #222; vertical-align:top;`;
+  const td = `padding:8px; border-top:1px solid #E6E8EC; vertical-align:top;`;
   const rows = logs.map(l => `
     <tr>
-      <td style="${td} color:#666; white-space:nowrap; font-size:12px;">${new Date(l.created_at).toLocaleString("pt-BR", {dateStyle:"short", timeStyle:"medium"})}</td>
-      <td style="${td} white-space:nowrap;">${l.email ? `<a href="/admin/logs?email=${encodeURIComponent(l.email)}" style="color:#aaa;">${escapeHtml(l.email)}</a>` : `<span style="color:#555;">—</span>`}</td>
+      <td style="${td} color:#6B7280; white-space:nowrap; font-size:12px;">${new Date(l.created_at).toLocaleString("pt-BR", {dateStyle:"short", timeStyle:"medium"})}</td>
+      <td style="${td} white-space:nowrap;">${l.email ? `<a href="/admin/logs?email=${encodeURIComponent(l.email)}" style="color:#4A5260;">${escapeHtml(l.email)}</a>` : `<span style="color:#6B7280;">—</span>`}</td>
       <td style="${td}"><span style="background:${badgeColor(l.action)}20; color:${badgeColor(l.action)}; padding:3px 9px; border-radius:10px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; white-space:nowrap;">${escapeHtml(l.action)}</span></td>
-      <td style="${td} color:#999; font-size:12px; word-break:break-word; max-width:400px;">${escapeHtml(l.details || "")}</td>
-      <td style="${td} color:#555; font-size:11px; white-space:nowrap;">${escapeHtml(l.ip || "")}</td>
+      <td style="${td} color:#5B6370; font-size:12px; word-break:break-word; max-width:400px;">${escapeHtml(l.details || "")}</td>
+      <td style="${td} color:#6B7280; font-size:11px; white-space:nowrap;">${escapeHtml(l.ip || "")}</td>
     </tr>`).join("");
 
   const content = `
   <div class="page-title">📋 Logs de Atividade</div>
-  <div class="page-sub"><a href="/admin" style="color:#5b9bd5;">← Voltar ao painel</a> · Últimos 200 registros${email || action ? " (filtrados)" : ""}.</div>
+  <div class="page-sub"><a href="/admin" style="color:#2560CC;">← Voltar ao painel</a> · Últimos 200 registros${email || action ? " (filtrados)" : ""}.</div>
   <div class="card" style="overflow-x:auto;">
     <div class="card-title" style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
       <span>Atividades (${logs.length})</span>
       <form method="get" action="/admin/logs" style="display:flex; gap:6px; flex-wrap:wrap;">
-        <input type="text" name="email" value="${escapeHtml(email)}" placeholder="Filtrar por e-mail..." style="background:#181818; border:1px solid #2e2e2e; color:#f0f0f0; padding:7px 12px; border-radius:2px; font-size:13px; width:190px;">
-        <select name="action" style="background:#181818; border:1px solid #2e2e2e; color:#ccc; padding:7px 10px; border-radius:2px; font-size:13px;">
+        <input type="text" name="email" value="${escapeHtml(email)}" placeholder="Filtrar por e-mail..." style="background:#F4F6F9; border:1px solid #E3E6EB; color:#14171C; padding:7px 12px; border-radius:2px; font-size:13px; width:190px;">
+        <select name="action" style="background:#F4F6F9; border:1px solid #E3E6EB; color:#3F4652; padding:7px 10px; border-radius:2px; font-size:13px;">
           <option value="">Todas as ações</option>
           ${actions.map(a => `<option value="${escapeHtml(a)}" ${a === action ? "selected" : ""}>${escapeHtml(a)}</option>`).join("")}
         </select>
-        <button type="submit" style="background:#2a2a2a; border:1px solid #3a3a3a; color:#ccc; padding:7px 14px; border-radius:2px; font-size:12px; cursor:pointer;">Filtrar</button>
-        ${email || action ? '<a href="/admin/logs" style="align-self:center; color:#666; font-size:12px;">limpar</a>' : ''}
+        <button type="submit" style="background:#EEF1F5; border:1px solid #D5D9E0; color:#3F4652; padding:7px 14px; border-radius:2px; font-size:12px; cursor:pointer;">Filtrar</button>
+        ${email || action ? '<a href="/admin/logs" style="align-self:center; color:#6B7280; font-size:12px;">limpar</a>' : ''}
       </form>
     </div>
     <table style="width:100%; border-collapse:collapse; font-size:13px;">
       <thead>
-        <tr style="color:#555; text-transform:uppercase; font-size:11px; letter-spacing:0.08em; text-align:left;">
+        <tr style="color:#6B7280; text-transform:uppercase; font-size:11px; letter-spacing:0.08em; text-align:left;">
           <th style="padding:8px;">Quando</th><th style="padding:8px;">Usuário</th><th style="padding:8px;">Ação</th><th style="padding:8px;">Detalhes</th><th style="padding:8px;">IP</th>
         </tr>
       </thead>
-      <tbody style="color:#aaa;">${rows || `<tr><td colspan="5" style="padding:20px; text-align:center; color:#555;">Nenhum log ainda.</td></tr>`}</tbody>
+      <tbody style="color:#4A5260;">${rows || `<tr><td colspan="5" style="padding:20px; text-align:center; color:#6B7280;">Nenhum log ainda.</td></tr>`}</tbody>
     </table>
   </div>`;
   res.send(renderSubPage("Admin", content, req.user));
 });
 
+
+// ══════════════════════════════════════════════════════════
+// 📥 EXPORTAÇÃO DE DADOS (somente admin)
+// ══════════════════════════════════════════════════════════
+const VERDICT_LABELS = {
+  provavelmente_falso: "Provavelmente falso",
+  suspeito: "Suspeito",
+  nao_verificado: "Não verificado",
+  provavelmente_verdadeiro: "Provavelmente verdadeiro"
+};
+
+function csvCell(v) {
+  let t = v === null || v === undefined ? "" : String(v);
+  if (/^[=+\-@]/.test(t)) t = "'" + t; // impede que o Excel leia o texto como fórmula
+  return '"' + t.replace(/"/g, '""') + '"';
+}
+function toCsv(cols, rows) {
+  const head = cols.map(c => csvCell(c.label)).join(";");
+  const body = rows.map(r => cols.map(c => csvCell(c.get ? c.get(r) : r[c.key])).join(";"));
+  return "\uFEFF" + [head, ...body].join("\r\n") + "\r\n"; // BOM = acentos certos no Excel
+}
+function fileStamp() {
+  return new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+}
+function sendDownload(res, filename, mime, body) {
+  res.setHeader("Content-Type", `${mime}; charset=utf-8`);
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.send(body);
+}
+function brDateTime(v) {
+  if (!v) return "";
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? String(v) : d.toLocaleString("pt-BR");
+}
+
+function exportUsers() {
+  return db.prepare(`
+    SELECT u.id, u.name, u.email, u.created_at,
+           COALESCE(m.count, 0) AS month_usage,
+           COALESCE(t.total, 0) AS total_usage,
+           (SELECT COUNT(*) FROM history h WHERE h.user_id = u.id) AS historico,
+           (SELECT MAX(h2.created_at) FROM history h2 WHERE h2.user_id = u.id) AS ultima_pesquisa,
+           (SELECT MAX(a.created_at) FROM activity_log a WHERE a.user_id = u.id AND a.action = 'login') AS ultimo_login
+    FROM users u
+    LEFT JOIN usage m ON m.user_id = u.id AND m.month = ?
+    LEFT JOIN (SELECT user_id, SUM(count) AS total FROM usage GROUP BY user_id) t ON t.user_id = u.id
+    ORDER BY u.id
+  `).all(currentMonth());
+}
+
+function exportHistory(userId = null) {
+  const base = `
+    SELECT h.id, h.user_id, u.name AS user_name, u.email AS user_email,
+           h.created_at, h.type, h.verdict, h.summary, h.text
+    FROM history h LEFT JOIN users u ON u.id = h.user_id`;
+  return userId
+    ? db.prepare(base + " WHERE h.user_id = ? ORDER BY h.id DESC").all(userId)
+    : db.prepare(base + " ORDER BY h.user_id ASC, h.id DESC").all();
+}
+
+function exportLogs(userId = null) {
+  return userId
+    ? db.prepare("SELECT * FROM activity_log WHERE user_id = ? ORDER BY id DESC").all(userId)
+    : db.prepare("SELECT * FROM activity_log ORDER BY id DESC").all();
+}
+
+// 📥 Usuários (CSV)
+app.get("/admin/exportar/usuarios", requireAuth, requireAdmin, (req, res) => {
+  const rows = exportUsers();
+  const csv = toCsv([
+    { label: "ID", key: "id" },
+    { label: "Nome", key: "name" },
+    { label: "E-mail", key: "email" },
+    { label: "Conta criada em", get: r => brDateTime(r.created_at) },
+    { label: "Verificações no mês", key: "month_usage" },
+    { label: "Verificações no total", key: "total_usage" },
+    { label: "Pesquisas salvas", key: "historico" },
+    { label: "Última pesquisa", get: r => brDateTime(r.ultima_pesquisa) },
+    { label: "Último login", get: r => brDateTime(r.ultimo_login) }
+  ], rows);
+  logActivity(req.user.id, req.user.email, "admin_exportou", `usuários (${rows.length} linhas)`, req);
+  sendDownload(res, `ecoa-saude-usuarios-${fileStamp()}.csv`, "text/csv", csv);
+});
+
+// 📥 Pesquisas de todos (CSV) — ou de um usuário com ?user_id=
+app.get("/admin/exportar/pesquisas", requireAuth, requireAdmin, (req, res) => {
+  const userId = req.query.user_id ? Number(req.query.user_id) : null;
+  const rows = exportHistory(userId);
+  const csv = toCsv([
+    { label: "ID", key: "id" },
+    { label: "Usuário (ID)", key: "user_id" },
+    { label: "Nome", key: "user_name" },
+    { label: "E-mail", key: "user_email" },
+    { label: "Quando", get: r => brDateTime(r.created_at) },
+    { label: "Tipo", key: "type" },
+    { label: "Veredito", get: r => VERDICT_LABELS[r.verdict] || r.verdict || "" },
+    { label: "Resumo", key: "summary" },
+    { label: "O que foi pesquisado", key: "text" }
+  ], rows);
+  logActivity(req.user.id, req.user.email, "admin_exportou", `pesquisas (${rows.length} linhas)`, req);
+  sendDownload(res, `ecoa-saude-pesquisas-${fileStamp()}.csv`, "text/csv", csv);
+});
+
+// 📥 Logs de atividade (CSV)
+app.get("/admin/exportar/logs", requireAuth, requireAdmin, (req, res) => {
+  const rows = exportLogs(req.query.user_id ? Number(req.query.user_id) : null);
+  const csv = toCsv([
+    { label: "ID", key: "id" },
+    { label: "Quando", get: r => brDateTime(r.created_at) },
+    { label: "Usuário (ID)", key: "user_id" },
+    { label: "E-mail", key: "email" },
+    { label: "Ação", key: "action" },
+    { label: "Detalhes", key: "details" },
+    { label: "IP", key: "ip" }
+  ], rows);
+  logActivity(req.user.id, req.user.email, "admin_exportou", `logs (${rows.length} linhas)`, req);
+  sendDownload(res, `ecoa-saude-logs-${fileStamp()}.csv`, "text/csv", csv);
+});
+
+// 📥 Tudo em um arquivo (JSON). Com ?completo=1 inclui o relatório completo de cada pesquisa.
+app.get("/admin/exportar/tudo", requireAuth, requireAdmin, (req, res) => {
+  const completo = req.query.completo === "1";
+  const users = exportUsers();
+  const history = exportHistory();
+  const byUser = new Map(users.map(u => [u.id, []]));
+  for (const h of history) {
+    const item = {
+      id: h.id,
+      quando: h.created_at,
+      tipo: h.type || null,
+      veredito: h.verdict || null,
+      resumo: h.summary || null,
+      pesquisa: h.text
+    };
+    if (completo) {
+      const full = getHistoryResult(h.user_id, h.id);
+      if (full) item.relatorio = full;
+    }
+    if (!byUser.has(h.user_id)) byUser.set(h.user_id, []);
+    byUser.get(h.user_id).push(item);
+  }
+  const data = {
+    app: "Ecoa Saúde",
+    exportado_em: new Date().toISOString(),
+    exportado_por: req.user.email,
+    totais: { usuarios: users.length, pesquisas: history.length },
+    usuarios: users.map(u => ({
+      id: u.id,
+      nome: u.name,
+      email: u.email,
+      criado_em: u.created_at,
+      verificacoes_no_mes: u.month_usage,
+      verificacoes_no_total: u.total_usage,
+      ultimo_login: u.ultimo_login || null,
+      pesquisas: byUser.get(u.id) || []
+    }))
+  };
+  logActivity(req.user.id, req.user.email, "admin_exportou", `tudo${completo ? " (com relatórios)" : ""}: ${users.length} usuários, ${history.length} pesquisas`, req);
+  sendDownload(res, `ecoa-saude-tudo-${fileStamp()}.json`, "application/json", JSON.stringify(data, null, 2));
+});
+
+// 📥 Um usuário específico (JSON com pesquisas, relatórios e logs)
+app.get("/admin/exportar/usuario/:id", requireAuth, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const user = db.prepare("SELECT id, name, email, created_at FROM users WHERE id = ?").get(id);
+  if (!user) return res.redirect("/admin?erro=" + encodeURIComponent("Usuário não encontrado."));
+  const pesquisas = exportHistory(id).map(h => {
+    const full = getHistoryResult(id, h.id);
+    return {
+      id: h.id,
+      quando: h.created_at,
+      tipo: h.type || null,
+      veredito: h.verdict || null,
+      resumo: h.summary || null,
+      pesquisa: h.text,
+      ...(full ? { relatorio: full } : {})
+    };
+  });
+  const data = {
+    app: "Ecoa Saúde",
+    exportado_em: new Date().toISOString(),
+    exportado_por: req.user.email,
+    usuario: {
+      id: user.id,
+      nome: user.name,
+      email: user.email,
+      criado_em: user.created_at,
+      verificacoes_no_mes: getUsage(id),
+      verificacoes_no_total: getTotalUsage(id)
+    },
+    pesquisas,
+    atividades: exportLogs(id)
+  };
+  logActivity(req.user.id, req.user.email, "admin_exportou", `usuário ${user.email} (${pesquisas.length} pesquisas)`, req);
+  sendDownload(res, `ecoa-saude-usuario-${id}-${fileStamp()}.json`, "application/json", JSON.stringify(data, null, 2));
+});
+
 (async () => {
   await ensureTempDir();
   const llmInfo = CONFIG.OPENAI_API_KEY ? `OpenAI ${CONFIG.OPENAI_MODEL}` : `Ollama ${CONFIG.OLLAMA_MODEL} (local)`;
-  app.listen(CONFIG.PORT, () => console.log(`🤖 Verifacts (IA Detection + Fact Check) em http://localhost:${CONFIG.PORT}\n🧠 LLM: ${llmInfo}`));
-})();
-
-// Insere o plano Pessoal na posição certa (entre Grátis e Starter),
-// preservando a ordem de exibição no site e no app.
-(function addPlanoPessoal() {
-  if (PLANS.pessoal) return; // já existe
-  const old = { ...PLANS };
-  for (const k of Object.keys(PLANS)) delete PLANS[k];
-  PLANS.gratis = old.gratis;
-  PLANS.pessoal = { name: "Pessoal", limit: 30, price: "R$ 19,90/mês" };
-  PLANS.starter = old.starter;
-  PLANS.profissional = old.profissional;
-  PLANS.institucional = old.institucional;
-  // preço em centavos para o checkout Stripe (mesmo padrão dos outros)
-  PLAN_PRICES_BRL.pessoal = 1990;
-  console.log("💚 Plano Pessoal (R$ 19,90) adicionado");
+  app.listen(CONFIG.PORT, () => console.log(`🤖 Ecoa Saúde (IA Detection + Fact Check) em http://localhost:${CONFIG.PORT}\n🧠 LLM: ${llmInfo}`));
 })();
 
 // ╔══════════════════════════════════════════════════════════════════════╗
@@ -4289,7 +3744,7 @@ function apiIssueToken(userId) {
 }
 
 function apiPublicUser(u) {
-  return { id: u.id, email: u.email, plan: u.plan || "gratis", isAdmin: isAdmin(u) };
+  return { id: u.id, email: u.email, isAdmin: isAdmin(u) };
 }
 
 // Middleware: autentica pelo header "Authorization: Bearer <token>"
@@ -4304,6 +3759,7 @@ function apiAuth(req, res, next) {
   db.prepare("UPDATE api_tokens SET last_used = ? WHERE token = ?")
     .run(new Date().toISOString(), token);
   req.user = user;
+  req.apiToken = token;
   next();
 }
 
@@ -4368,17 +3824,6 @@ app.post("/api/auth/register", apiJson, rateLimit(5, 30 * 60000), (req, res) => 
 
   const name = email.split("@")[0];
   const id = createUser({ name, email, password });
-
-  // 🛡️ antifraude: restaura consumo de trial se este e-mail já usou antes
-  try {
-    const prior = getPriorTrialUsage(email);
-    if (prior > 0) {
-      db.prepare(`INSERT INTO usage (user_id, month, count) VALUES (?,?,?)
-        ON CONFLICT(user_id, month) DO UPDATE SET count = MAX(count, excluded.count)`)
-        .run(id, currentMonth(), prior);
-    }
-  } catch (_) {}
-
   const user = findUserById(id);
   const token = apiIssueToken(id);
   logActivity(id, email, "registro", "app mobile", req);
@@ -4400,7 +3845,7 @@ app.get("/api/me", apiAuth, (req, res) => {
   const info = usageInfo(req.user);
   res.json({
     user: apiPublicUser(req.user),
-    usage: { used: info.used, limit: info.unlimited ? null : info.limit },
+    usage: { used: info.used, total: info.total, limit: null },
   });
 });
 
@@ -4408,10 +3853,6 @@ app.get("/api/me", apiAuth, (req, res) => {
 app.post("/api/verify", apiAuth, apiJson, async (req, res) => {
   const content = String(req.body?.content || "").trim();
   if (!content) return res.status(400).json({ message: "Envie um texto ou link." });
-
-  const info = usageInfo(req.user);
-  if (!info.unlimited && info.used >= info.limit)
-    return res.status(402).json({ message: "Limite do plano atingido. Faça upgrade para continuar." });
 
   try {
     const urls = extractUrls(content);
@@ -4486,67 +3927,7 @@ app.delete("/api/history", apiAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// ── PLANOS ──────────────────────────────────────────────────────────────────
-app.get("/api/plans", (req, res) => {
-  const feats = {
-    gratis: ["Texto e links", "Checagens do Google", "2 verificações vitalícias"],
-    pessoal: ["Texto, links e imagens", "Detecção de IA", "30 verificações/mês"],
-    starter: ["Texto, links e imagens", "Detecção de IA", "100/mês"],
-    profissional: ["Tudo do Starter", "Análise de vídeo", "1.000/mês"],
-    institucional: ["Verificações ilimitadas", "Multiusuário", "Suporte dedicado"],
-  };
-  res.json(Object.entries(PLANS).map(([id, p]) => ({
-    id,
-    name: p.name,
-    price: p.price,
-    limit: p.limit === -1 ? "Ilimitado" : `${p.limit} verificações/${p.lifetime ? "vitalícias" : "mês"}`,
-    features: feats[id] || [],
-  })));
-});
-
-// "Assinar" no app abre a página de planos do site (fluxo Stripe já existente)
-app.post("/api/checkout", apiAuth, apiJson, async (req, res) => {
-  // Cria a sessão do Stripe e devolve a URL do checkout (mesma lógica do site).
-  if (!stripe) return res.status(501).json({ message: "Pagamentos ainda não configurados." });
-  const plan = String(req.body?.planId || req.body?.plan || "");
-  if (!PLAN_PRICES_BRL[plan]) return res.status(400).json({ message: "Plano inválido." });
-  if (req.user.stripe_subscription_id) {
-    return res.status(409).json({ message: "Você já tem uma assinatura ativa. Gerencie-a no site." });
-  }
-  try {
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      client_reference_id: String(req.user.id),
-      ...(req.user.stripe_customer_id
-        ? { customer: req.user.stripe_customer_id }
-        : { customer_email: req.user.email }),
-      metadata: { plan, userId: String(req.user.id) },
-      subscription_data: { metadata: { plan, userId: String(req.user.id) } },
-      line_items: [{
-        quantity: 1,
-        price_data: {
-          currency: "brl",
-          unit_amount: PLAN_PRICES_BRL[plan],
-          recurring: { interval: "month" },
-          product_data: {
-            name: `Verifacts ${PLANS[plan] ? PLANS[plan].name : plan}`,
-            description: PLANS[plan] && PLANS[plan].limit === -1
-              ? "Verificações ilimitadas"
-              : `${PLANS[plan] ? PLANS[plan].limit : ""} verificações/mês`
-          }
-        }
-      }],
-      success_url: `${CONFIG.APP_URL}/planos/sucesso?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${CONFIG.APP_URL}/planos?erro=` + encodeURIComponent("Pagamento cancelado. Nenhuma cobrança foi feita.")
-    });
-    res.json({ url: session.url });
-  } catch (e) {
-    console.error("[Stripe] Checkout app:", e.message);
-    res.status(500).json({ message: "Erro ao iniciar pagamento: " + e.message });
-  }
-});
-
-console.log("📱 API mobile do Verifacts montada em /api/*");
+console.log("📱 API mobile do Ecoa Saúde montada em /api/*");
 // ╚═══════════════════ FIM DO BLOCO — cole antes do app.listen ════════════╝
 
 // ╔══════════════════════════════════════════════════════════════════════╗
@@ -4588,12 +3969,6 @@ app.post("/api/verify/image", apiAuth, (req, res) => {
     if (err) return res.status(400).json({ message: err.message || "Erro no upload." });
     if (!req.file) return res.status(400).json({ message: "Nenhuma imagem enviada." });
 
-    const info = usageInfo(req.user);
-    if (!info.unlimited && info.used >= info.limit) {
-      await cleanup(req.file.path);
-      return res.status(402).json({ message: "Limite do plano atingido." });
-    }
-
     try {
       const result = await analyzeImage(req.file.path, req.body?.caption || "");
       incrementUsage(req.user.id);
@@ -4630,12 +4005,6 @@ app.post("/api/verify/video", apiAuth, (req, res) => {
     if (!(req.file.mimetype || "").startsWith("video/")) {
       await cleanup(req.file.path);
       return res.status(400).json({ message: "Envie um arquivo de vídeo." });
-    }
-
-    const info = usageInfo(req.user);
-    if (!info.unlimited && info.used >= info.limit) {
-      await cleanup(req.file.path);
-      return res.status(402).json({ message: "Limite do plano atingido. Faça upgrade para continuar." });
     }
 
     try {
@@ -4704,7 +4073,8 @@ app.post("/api/account/profile", apiAuth, apiJson, (req, res) => {
 app.post("/api/account/password", apiAuth, apiJson, (req, res) => {
   const current = String(req.body?.current || "");
   const next = String(req.body?.next || "");
-  if (!bcrypt.compareSync(current, req.user.password_hash)) {
+  const full = getUserWithHash(req.user.id);
+  if (!full || !bcrypt.compareSync(current, full.password_hash)) {
     return res.status(401).json({ message: "Senha atual incorreta." });
   }
   if (next.length < 6) {
@@ -4714,7 +4084,7 @@ app.post("/api/account/password", apiAuth, apiJson, (req, res) => {
     .run(bcrypt.hashSync(next, 10), req.user.id);
   // invalida os outros tokens do app (mantém só a sessão atual)
   db.prepare("DELETE FROM api_tokens WHERE user_id = ? AND token != ?")
-    .run(req.user.id, req.apiToken);
+    .run(req.user.id, req.apiToken || "");
   logActivity(req.user.id, req.user.email, "senha_alterada", "app mobile", req);
   res.json({ ok: true });
 });
@@ -4723,15 +4093,12 @@ app.post("/api/account/password", apiAuth, apiJson, (req, res) => {
 // conforme a Política de Privacidade)
 app.post("/api/account/delete", apiAuth, apiJson, (req, res) => {
   const password = String(req.body?.password || "");
-  if (!bcrypt.compareSync(password, req.user.password_hash)) {
+  const full = getUserWithHash(req.user.id);
+  if (!full || !bcrypt.compareSync(password, full.password_hash)) {
     return res.status(401).json({ message: "Senha incorreta." });
   }
   const uid = req.user.id;
   const email = req.user.email;
-  try {
-    // registra o consumo do trial no hash antifraude ANTES de apagar
-    recordTrialUsage(email, getTotalUsage(uid));
-  } catch (_) {}
   db.prepare("DELETE FROM push_tokens WHERE user_id = ?").run(uid);
   db.prepare("DELETE FROM api_tokens WHERE user_id = ?").run(uid);
   deleteUser(uid); // apaga uso + histórico + usuário
