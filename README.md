@@ -132,7 +132,7 @@ AI detection in images relies on **heuristics**, not a trained model, and can be
 
 ### License
 
-Distributed under the MIT License. See [LICENSE](LICENSE).
+Distributed under the MIT License. See [LICENSE](LICENSE.txt).
 
 ---
 
@@ -266,4 +266,4 @@ A detecção de IA em imagens usa **heurísticas**, não um modelo treinado, e p
 
 ### Licença
 
-Distribuído sob a licença MIT. Veja [LICENSE](LICENSE).
+Distribuído sob a licença MIT. Veja [LICENSE](LICENSE.txt).
