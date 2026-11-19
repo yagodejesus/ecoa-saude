@@ -384,7 +384,7 @@ function escapeHtml(s = "") {
 }
 
 // ── AI DETECTION Fallback (Heurística Local) ──
-// ========== VERSÃO V3: MEGA-ULTRA-AVANÇADA COM THRESHOLDS OTIMIZADOS (90-95%) ==========
+// ========== Triagem heurística v3: 22 indicadores com limiares fixos (NÃO calibrados; ver README) ==========
 async function detectAIInImageFallback(imagePath) {
   try {
     const image = sharp(imagePath);
@@ -397,6 +397,7 @@ async function detectAIInImageFallback(imagePath) {
     // 2. EXTRAIR DADOS BRUTOS
     const { data, info } = await image
       .resize(512, 512, { fit: 'inside', withoutEnlargement: true })
+      .ensureAlpha() // [v1.0.0] garante RGBA: o laço abaixo assume 4 canais por pixel
       .raw()
       .toBuffer({ resolveWithObject: true });
     
@@ -806,7 +807,7 @@ async function detectAIInImageFallback(imagePath) {
       ├─ Material: ${materialInconsistencyRatio.toFixed(3)} (${materialScore > 0 ? '⚠️' : '✓'}) [V3]
       └─ Bordas Anom.: ${anomalousEdgeRatio.toFixed(3)} (${edgeAnomalyScore > 0 ? '⚠️' : '✓'}) [V3]`;
     
-    console.log(`[IA Detection] Análise ULTRA-Avançada (90-95% Acertividade):
+    console.log(`[IA Detection] Triagem heurística (22 indicadores, limiares não calibrados):
       ${techniquesLog}
       └─ Resultado: ${aiProbability.toFixed(3)} → ${aiProbability > 0.75 ? '🚨🚨 CERTEZA AI' : aiProbability > 0.68 ? '🚨 PROVÁVEL AI' : aiProbability > 0.55 ? '⚠️ SUSPEITO' : '✓ PARECE REAL'}`
     );
@@ -844,11 +845,10 @@ async function detectAIInImageFallback(imagePath) {
     
     
     return {
-      aiProbability: parseFloat(aiProbability.toFixed(3)),
-      confidence: 0.95,
+      aiProbability: parseFloat(aiProbability.toFixed(3)), // escore heurístico, não probabilidade calibrada
       label: aiProbability > 0.75 ? 'ai_generated' : aiProbability > 0.68 ? 'ai_generated' : aiProbability > 0.55 ? 'suspicious' : 'authentic',
       isAI: aiProbability > 0.68,
-      source: 'mega_ultra_advanced_heuristic_90_95',
+      source: 'heuristic_v3',
       noiseScore: parseFloat(variance.toFixed(3)),
       artifactScore: parseFloat((1 - edgeRatio).toFixed(3)),
       // 🔴 [NOVO] Coordenadas dos rastros de IA (bolinhas)
@@ -893,10 +893,9 @@ async function detectAIInImageFallback(imagePath) {
     console.error("[IA Detection] Erro na análise ultra-avançada:", e.message);
     return {
       aiProbability: 0.5,
-      confidence: 0.3,
       label: 'error',
       isAI: false,
-      source: 'ultra_advanced_heuristic_no_ai'
+      source: 'heuristic_v3_error'
     };
   }
 }
@@ -918,15 +917,19 @@ async function generateHeatmap(imagePath) {
     const windowSize = 3;
     for (let y = windowSize; y < height - windowSize; y++) {
       for (let x = windowSize; x < width - windowSize; x++) {
-        let variance = 0;
+        // [v1.0.0] desvio-padrão local dos níveis de cinza (textura), escalado para 0-255
+        let sum = 0, sumSq = 0;
+        const n = (windowSize * 2 + 1) ** 2;
         for (let dy = -windowSize; dy <= windowSize; dy++) {
           for (let dx = -windowSize; dx <= windowSize; dx++) {
             const idx = ((y + dy) * width + (x + dx)) * channels;
             const gray = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-            variance += gray * gray;
+            sum += gray; sumSq += gray * gray;
           }
         }
-        heatmapData[y * width + x] = Math.min(255, Math.sqrt(variance / ((windowSize * 2 + 1) ** 2)));
+        const mean = sum / n;
+        const std = Math.sqrt(Math.max(0, sumSq / n - mean * mean));
+        heatmapData[y * width + x] = Math.min(255, Math.round(std * 4));
       }
     }
     
@@ -1432,11 +1435,12 @@ function formatResultHtml(result) {
   let aiSection = "";
   if (result.aiDetection) {
     const aiPct = Math.round((result.aiDetection.aiProbability || 0) * 100);
-    const confPct = Math.round((result.aiDetection.confidence || 0) * 100);
+    const techList = Object.values(result.aiDetection.techniques || {});
+    const firedCount = techList.filter(t => (t && t.score) > 0).length;
     const source = result.aiDetection.source || 'unknown';
     const isAPI = source.includes('replicate');
     
-    const aiStatus = aiPct > 70 ? "⚠️ POSSÍVEL IA" : aiPct > 40 ? "⚠️ SUSPEITA" : "✓ AUTÊNTICA";
+    const aiStatus = aiPct > 70 ? "⚠️ POSSÍVEL IA" : aiPct > 40 ? "⚠️ SUSPEITA" : "✓ POUCOS SINAIS DE IA";
     const aiColor = aiPct > 70 ? "#C62828" : aiPct > 40 ? "#B45F06" : "#2E8B57";
     
     aiSection = `<div style="background: #EEF3FC; border: 1px solid #CCDAF3; border-radius: 18px; padding: 20px; margin-bottom: 20px;">
@@ -1445,14 +1449,14 @@ function formatResultHtml(result) {
       </div>
       <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 16px;">
         <div>
-          <div style="color: #6B7280; font-size: 12px; margin-bottom: 8px;">Probabilidade de IA</div>
+          <div style="color: #6B7280; font-size: 12px; margin-bottom: 8px;">Escore de IA (heurístico)</div>
           <div style="font-size: 28px; font-weight: 700; color: ${aiColor};">${aiPct}%</div>
           <div style="color: #4A5260; font-size: 12px; margin-top: 4px;">${aiStatus}</div>
         </div>
         <div>
-          <div style="color: #6B7280; font-size: 12px; margin-bottom: 8px;">Confiança</div>
-          <div style="font-size: 28px; font-weight: 700; color: #2560CC;">${confPct}%</div>
-          <div style="color: #4A5260; font-size: 12px; margin-top: 4px;">${isAPI ? 'Modelo IA' : 'Heurística'}</div>
+          <div style="color: #6B7280; font-size: 12px; margin-bottom: 8px;">Indicadores ativados</div>
+          <div style="font-size: 28px; font-weight: 700; color: #2560CC;">${firedCount}/${techList.length || 22}</div>
+          <div style="color: #4A5260; font-size: 12px; margin-top: 4px;">${isAPI ? 'Modelo IA' : 'Triagem heurística'}</div>
         </div>
         <div>
           <div style="color: #6B7280; font-size: 12px; margin-bottom: 8px;">Classificação</div>
@@ -1465,7 +1469,8 @@ function formatResultHtml(result) {
           <div><span style="color: #6B7280; font-size: 11px;">Artefatos:</span> <span style="color: #2560CC; font-weight: 600;">${Math.round((result.aiDetection.artifactScore || 0) * 100)}%</span></div>
         </div>
       ` : ''}
-      ${result.heatmapBase64 ? `<div style="margin-top: 16px;"><div style="font-size: 12px; color: #6B7280; margin-bottom: 8px;">Mapa de Calor (Anomalias):</div><img src="data:image/png;base64,${result.heatmapBase64}" style="width: 100%; max-width: 500px; border-radius: 4px; border: 1px solid #E3E6EB;"><div style="color: #6B7280; font-size: 11px; margin-top: 8px;">🔵 Azul = Autêntico | 🔴 Vermelho = Possível IA</div></div>` : ""}
+      ${result.heatmapBase64 ? `<div style="margin-top: 16px;"><div style="font-size: 12px; color: #6B7280; margin-bottom: 8px;">Mapa de textura local (desvio-padrão, janelas 7×7):</div><img src="data:image/png;base64,${result.heatmapBase64}" style="width: 100%; max-width: 500px; border-radius: 4px; border: 1px solid #E3E6EB;"><div style="color: #6B7280; font-size: 11px; margin-top: 8px;">Azul = regiões lisas · Vermelho = regiões com muita textura. Apoio à inspeção visual, não é prova.</div></div>` : ""}
+      <div style="color: #6B7280; font-size: 11px; margin-top: 12px;">Triagem experimental, com limiares ainda não calibrados: fotos reais e capturas de tela podem receber escore alto. Confirme com a origem da imagem.</div>
     </div>`;
   }
   
@@ -1475,13 +1480,13 @@ function formatResultHtml(result) {
     const avgAI = (result.frameAnalyses.reduce((a, f) => a + f.aiProbability, 0) / result.frameAnalyses.length * 100).toFixed(0);
     videoFramesSection = `<div style="background: #EEF3FC; border: 1px solid #CCDAF3; border-radius: 18px; padding: 20px; margin-bottom: 20px;">
       <div style="font-size: 12px; color: #2560CC; text-transform: uppercase; font-weight: 700; margin-bottom: 16px;">🎬 Análise de Frames - Técnicas Ativadas</div>
-      <div style="margin-bottom: 16px; padding: 8px; background: #F4F6F9; border-radius: 4px; color: #4A5260; font-size: 12px;">IA Detectada (Média): <span style="color: #2560CC; font-weight: 700;">${avgAI}%</span></div>
+      <div style="margin-bottom: 16px; padding: 8px; background: #F4F6F9; border-radius: 4px; color: #4A5260; font-size: 12px;">Escore de IA (média dos frames): <span style="color: #2560CC; font-weight: 700;">${avgAI}%</span></div>
       <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr)); gap: 16px;">`;
     
     result.frameAnalyses.forEach((frame, idx) => {
       const frameAiPct = Math.round((frame.aiProbability || 0) * 100);
       const frameColor = frameAiPct > 70 ? "#C62828" : frameAiPct > 40 ? "#B45F06" : "#2E8B57";
-      const frameLabel = frameAiPct > 70 ? "CERTEZA IA" : frameAiPct > 40 ? "SUSPEITO" : "PARECE REAL";
+      const frameLabel = frameAiPct > 70 ? "POSSÍVEL IA" : frameAiPct > 40 ? "SUSPEITO" : "POUCOS SINAIS";
       
       // 🔴 Separar técnicas ativadas (IA) das limpas (OK)
       const techniques = frame.techniques || {};
@@ -1553,7 +1558,7 @@ function formatResultHtml(result) {
         
         <!-- Barra de IA Detectada -->
         <div style="padding: 12px 14px; background: #F4F6F9; border-radius: 6px; margin-bottom: 14px; border-left: 4px solid ${frameColor}; display: flex; align-items: center; justify-content: space-between;">
-          <span style="color: #4A5260; font-size: 14px; font-weight: 600;">IA Detectada</span>
+          <span style="color: #4A5260; font-size: 14px; font-weight: 600;">Escore de IA</span>
           <span style="color: ${frameColor}; font-size: 32px; font-weight: 700; line-height: 1;">${frameAiPct}%</span>
         </div>
         
@@ -2421,6 +2426,9 @@ function renderPage(content = "", user = null) {
     .src-item { padding: 13px 15px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg2); display: flex; flex-direction: column; gap: 6px; transition: border-color .15s; }
     .src-item:hover { border-color: var(--line2); }
     .src-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .result-wrap .reason-i { min-width: 22px; flex-shrink: 0; white-space: nowrap; }
+    .result-wrap .src-row { flex-wrap: wrap; }
+    .result-wrap .src-pub { flex-shrink: 0; }
     .src-pub { font-size: 13.5px; font-weight: 700; color: var(--white); }
     .src-rating { font-size: 12.5px; color: var(--muted); text-align: right; }
     .src-text { font-size: 14px; color: var(--dim); line-height: 1.5; }
@@ -3930,14 +3938,7 @@ app.delete("/api/history", apiAuth, (req, res) => {
 console.log("📱 API mobile do Ecoa Saúde montada em /api/*");
 // ╚═══════════════════ FIM DO BLOCO — cole antes do app.listen ════════════╝
 
-// ╔══════════════════════════════════════════════════════════════════════╗
-// ║  SUBSTITUIÇÃO: ROTAS DE MÍDIA COM HEATMAP + TÉCNICAS + FRAMES          ║
-// ║                                                                         ║
-// ║  No seu app.js, APAGUE as rotas antigas:                                ║
-// ║     app.post("/api/verify/image", ...)   (bloco inteiro)                ║
-// ║     app.post("/api/verify/video", ...)   (bloco inteiro)                ║
-// ║  e cole ESTE bloco no lugar delas.                                      ║
-// ╚══════════════════════════════════════════════════════════════════════╝
+// ===== Rotas de mídia da API (/api/verify/image e /api/verify/video): escore heurístico, indicadores, mapa de textura e frames =====
 
 // Converte o breakdown das 22 técnicas num formato compacto pro app
 function apiMapTechniques(t) {
