@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Verificação de fatos + Detecção de IA em imagens e vídeos",
   "main": "app.js",
+  "license": "MIT",
   "scripts": {
     "start": "node app.js"
   },
