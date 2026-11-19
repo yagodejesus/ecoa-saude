@@ -3673,8 +3673,16 @@ app.get("/admin/exportar/usuario/:id", requireAuth, requireAdmin, (req, res) => 
 
 (async () => {
   await ensureTempDir();
-  const llmInfo = CONFIG.OPENAI_API_KEY ? `OpenAI ${CONFIG.OPENAI_MODEL}` : `Ollama ${CONFIG.OLLAMA_MODEL} (local)`;
-  app.listen(CONFIG.PORT, () => console.log(`🤖 Ecoa Saúde (IA Detection + Fact Check) em http://localhost:${CONFIG.PORT}\n🧠 LLM: ${llmInfo}`));
+
+  const llmInfo = CONFIG.OPENAI_API_KEY
+    ? `OpenAI ${CONFIG.OPENAI_MODEL}`
+    : `Ollama ${CONFIG.OLLAMA_MODEL} (local)`;
+
+  app.listen(CONFIG.PORT, "0.0.0.0", () => {
+    console.log(
+      `🤖 Ecoa Saúde rodando na porta ${CONFIG.PORT}\n🧠 LLM: ${llmInfo}`
+    );
+  });
 })();
 
 // ╔══════════════════════════════════════════════════════════════════════╗
