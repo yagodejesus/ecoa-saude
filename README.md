@@ -1,10 +1,12 @@
 # Ecoa Saúde
 
+[![CI](https://github.com/yagodejesus/ecoa-saude/actions/workflows/ci.yml/badge.svg)](https://github.com/yagodejesus/ecoa-saude/actions/workflows/ci.yml)
+
 [English](#english) | [Português](#português)
 
 ## English
 
-A **fact-checking** and **AI-generated content detection** platform for text, links, images and videos. Users submit content and get a verdict (likely false, suspicious, unverified or likely true), with an explanation, related fact-checks and recent news on the topic.
+A **fact-checking** platform for text, links, images and videos, with an experimental **screening for AI-generated images**. Users submit content and get a verdict (likely false, suspicious, unverified or likely true), with an explanation, related fact-checks and recent news on the topic.
 
 The project is a single-file Node.js/Express server ([app.js](app.js)) that serves the web interface and a REST API for the mobile app. The interface and prompts are in Brazilian Portuguese.
 
@@ -42,7 +44,7 @@ cd ecoa-saude
 npm install
 ```
 
-Create a `.env` file in the project root (see the variables below) and start the server:
+Copy `.env.example` to `.env`, fill in the values (see the variables below) and start the server:
 
 ```bash
 npm start
@@ -65,8 +67,9 @@ Open `http://localhost:3000`. The SQLite database (`verifacts.db`) is created au
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama address |
 | `OLLAMA_MODEL` | `gemma3` | Ollama model |
 | `GOOGLE_FACTCHECK_API_KEY` | — | Google Fact Check Tools API key |
+| `FACTCHECK_API_URL` | Google endpoint | Fact Check Tools API address (the tests point it to a simulated service) |
+| `NEWS_RSS_URL` | `https://news.google.com/rss/search` | News search address (the tests point it to a simulated feed) |
 | `MAX_NEWS_ITEMS` | `15` | Maximum news items fetched per check |
-| `NEWS_LOOKBACK_DAYS` | `90` | News search window, in days |
 | `MAX_SCRAPED_CHARS` | `5000` | Character limit extracted from a link |
 | `MAX_VIDEO_FRAMES` | `6` | Maximum frames analyzed per video |
 | `FRAME_INTERVAL_SECONDS` | `8` | Interval between extracted frames |
@@ -94,6 +97,14 @@ ADMIN_EMAILS=admin@example.com
 2. Set the environment variables, at least `NODE_ENV=production`, `SESSION_SECRET` and `APP_URL`.
 3. Mount a **Volume** (for example at `/data`) and set `DB_PATH=/data/verifacts.db`. Without it, the database is wiped on every deploy.
 4. Use `GET /health` as the health check.
+
+### Tests
+
+`npm test` runs a smoke test ([test/smoke.test.js](test/smoke.test.js)). It starts the server with simulated versions of the language model, the Fact Check Tools API and the news feed, creates an account, runs a text check and an image screening, and reopens the stored report. It needs no API keys or network access, and GitHub Actions runs it on every push.
+
+### Demo data
+
+`npm run seed:demo` loads three synthetic reports ([examples/synthetic-reports.json](examples/synthetic-reports.json)) for a demo account, so the interface can be explored without API keys or personal data. Then run `npm start` and sign in with `demo@example.org` / `ecoa-demo-2026`. The sources and links in these reports are fictional.
 
 ### Mobile API
 
@@ -130,6 +141,12 @@ Uploads accept images or videos only, up to 80 MB.
 
 AI detection in images relies on **heuristics**, not a trained model, and can be wrong in both directions. Fact-check verdicts depend on the evidence found and on the LLM used. Treat the results as an aid to verification, not as definitive proof.
 
+The server is a single file (`app.js`, about 4,100 lines). This keeps deployment simple but couples its parts; splitting it into modules (evidence retrieval, model router, media screening, storage and interface) is planned.
+
+### How to cite
+
+See [CITATION.cff](CITATION.cff) (GitHub shows it under "Cite this repository").
+
 ### License
 
 Distributed under the MIT License. See [LICENSE](LICENSE.txt).
@@ -138,7 +155,7 @@ Distributed under the MIT License. See [LICENSE](LICENSE.txt).
 
 ## Português
 
-Plataforma de **verificação de fatos** e **detecção de conteúdo gerado por IA** em textos, links, imagens e vídeos. O usuário envia um conteúdo e recebe um veredito (provavelmente falso, suspeito, não verificado ou provavelmente verdadeiro), com justificativa, checagens de fatos relacionadas e notícias recentes sobre o assunto.
+Plataforma de **verificação de fatos** em textos, links, imagens e vídeos, com **triagem experimental de imagens geradas por IA**. O usuário envia um conteúdo e recebe um veredito (provavelmente falso, suspeito, não verificado ou provavelmente verdadeiro), com justificativa, checagens de fatos relacionadas e notícias recentes sobre o assunto.
 
 O projeto é um servidor Node.js/Express de arquivo único ([app.js](app.js)) que serve a interface web e uma API REST para o app mobile.
 
@@ -176,7 +193,7 @@ cd ecoa-saude
 npm install
 ```
 
-Crie um arquivo `.env` na raiz (veja as variáveis abaixo) e inicie o servidor:
+Copie o `.env.example` para `.env`, preencha os valores (veja as variáveis abaixo) e inicie o servidor:
 
 ```bash
 npm start
@@ -199,8 +216,9 @@ Acesse em `http://localhost:3000`. O banco SQLite (`verifacts.db`) é criado aut
 | `OLLAMA_HOST` | `http://localhost:11434` | Endereço do Ollama |
 | `OLLAMA_MODEL` | `gemma3` | Modelo do Ollama |
 | `GOOGLE_FACTCHECK_API_KEY` | — | Chave da Google Fact Check Tools API |
+| `FACTCHECK_API_URL` | endereço do Google | Endereço da Fact Check Tools API (os testes apontam para um serviço simulado) |
+| `NEWS_RSS_URL` | `https://news.google.com/rss/search` | Endereço da busca de notícias (os testes apontam para um feed simulado) |
 | `MAX_NEWS_ITEMS` | `15` | Máximo de notícias consultadas por verificação |
-| `NEWS_LOOKBACK_DAYS` | `90` | Janela de busca de notícias, em dias |
 | `MAX_SCRAPED_CHARS` | `5000` | Limite de caracteres extraídos de um link |
 | `MAX_VIDEO_FRAMES` | `6` | Máximo de frames analisados por vídeo |
 | `FRAME_INTERVAL_SECONDS` | `8` | Intervalo entre frames extraídos |
@@ -228,6 +246,14 @@ ADMIN_EMAILS=admin@exemplo.com
 2. Defina as variáveis de ambiente, no mínimo `NODE_ENV=production`, `SESSION_SECRET` e `APP_URL`.
 3. Monte um **Volume** (por exemplo em `/data`) e defina `DB_PATH=/data/verifacts.db`. Sem isso, o banco é apagado a cada deploy.
 4. Use `GET /health` como health check.
+
+### Testes
+
+`npm test` roda um teste de fumaça ([test/smoke.test.js](test/smoke.test.js)). Ele sobe o servidor com versões simuladas do modelo de linguagem, da Fact Check Tools API e do feed de notícias, cria uma conta, faz uma checagem de texto e uma triagem de imagem e reabre o relatório salvo. Não precisa de chaves de API nem de internet, e o GitHub Actions o executa a cada push.
+
+### Dados de demonstração
+
+`npm run seed:demo` carrega três relatórios sintéticos ([examples/synthetic-reports.json](examples/synthetic-reports.json)) para uma conta de demonstração, para explorar a interface sem chaves de API nem dados pessoais. Depois rode `npm start` e entre com `demo@example.org` / `ecoa-demo-2026`. As fontes e os links desses relatórios são fictícios.
 
 ### API mobile
 
@@ -263,6 +289,12 @@ Uploads aceitam apenas imagem ou vídeo, com até 80 MB.
 ### Limitações
 
 A detecção de IA em imagens usa **heurísticas**, não um modelo treinado, e pode errar nos dois sentidos. Os vereditos de checagem dependem das evidências encontradas e do LLM usado. Trate os resultados como apoio à verificação, não como prova definitiva.
+
+O servidor é um arquivo único (`app.js`, cerca de 4.100 linhas). Isso simplifica o deploy, mas acopla as partes; está prevista a divisão em módulos (busca de evidências, roteador de modelos, triagem de mídia, armazenamento e interface).
+
+### Como citar
+
+Veja o [CITATION.cff](CITATION.cff) (o GitHub mostra em "Cite this repository").
 
 ### Licença
 

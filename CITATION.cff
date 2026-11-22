@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Ecoa Saúde"
+version: "1.0.1"
+abstract: >-
+  Open-source, evidence-grounded assistant for checking health
+  misinformation in Brazilian Portuguese. A language model extracts the
+  verifiable claim, the server retrieves professional fact-checks and recent
+  news, and a second model call returns a verdict with dated, cited reasons.
+license: MIT
+repository-code: "https://github.com/yagodejesus/ecoa-saude"
+url: "https://ecoa-saude-app.up.railway.app"
+keywords:
+  - health misinformation
+  - automated fact-checking
+  - large language models
+  - retrieval-augmented generation
+  - infodemic management
+  - Brazilian Portuguese
+authors:
+  - given-names: "Yago de Jesus"
+    family-names: "Martins"
+    affiliation: "Universidade Federal do Pará (UFPA)"
+  - given-names: "Aldemir Branco"
+    name-particle: "de"
+    family-names: "Oliveira Filho"
+    affiliation: "Universidade Federal do Pará (UFPA)"
+  - given-names: "Indira Angela Luza"
+    family-names: "Eyzaguirre"
+    affiliation: "Instituto Resiliência Inovadora"
+  - given-names: "Fabrício José Brito"
+    family-names: "Barros"
+    affiliation: "Universidade Federal do Pará (UFPA)"

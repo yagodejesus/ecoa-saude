@@ -1,0 +1,123 @@
+{
+  "description": "Synthetic reports for demonstrating the interface without API keys or personal data. Questions, sources, dates, texts and links are fictional (example.org); they are not real fact-checks. Load them with: npm run seed:demo",
+  "reports": [
+    {
+      "question": "Chá de alho com limão cura a gripe em um dia?",
+      "type": "TEXTO",
+      "result": {
+        "inputType": "texto",
+        "verdict": "provavelmente_falso",
+        "confidence": 0.85,
+        "summary": "[Exemplo sintético] A alegação é provavelmente falsa: a checagem fictícia da Agência Exemplo de Checagem (02/11/2026) e a reportagem fictícia do Jornal Exemplo (05/11/2026) explicam que nenhum chá cura a gripe.",
+        "reasons": [
+          "A Agência Exemplo de Checagem (fonte fictícia) classificou como falsa, em 02/11/2026, a mensagem que promete curar a gripe em 24 horas com chá de alho e limão.",
+          "O Jornal Exemplo (fonte fictícia) publicou em 05/11/2026 entrevista com uma infectologista: a gripe é causada pelo vírus influenza, e bebidas caseiras podem aliviar o desconforto, mas não eliminam o vírus.",
+          "Nenhuma das fontes do exemplo descreve estudo que mostre cura da gripe com alho ou limão."
+        ],
+        "reply": "Este relatório é um exemplo sintético, criado para demonstrar a interface; as fontes e os links são fictícios. Na situação simulada, uma mensagem afirma que chá de alho com limão cura a gripe em um dia. As duas fontes do exemplo dizem o contrário: a gripe é uma infecção viral, e chás podem trazer conforto, mas não a curam. A vacina anual é o que previne as formas graves, e quem tiver falta de ar, febre persistente ou piora dos sintomas deve procurar atendimento de saúde.",
+        "claimQuery": "chá de alho limão gripe",
+        "factChecks": [
+          {
+            "text": "Chá de alho com limão cura a gripe em 24 horas",
+            "claimant": "Mensagem em rede social (exemplo)",
+            "claimDate": "2026-11-01",
+            "reviews": [
+              {
+                "publisher": "Agência Exemplo de Checagem",
+                "title": "É falso que chá de alho com limão cure a gripe em um dia",
+                "textualRating": "Falso",
+                "url": "https://example.org/checagem/cha-de-alho-gripe",
+                "reviewDate": "2026-11-02",
+                "domain": "example.org",
+                "recencyScore": 1
+              }
+            ]
+          }
+        ],
+        "recentNews": [
+          {
+            "title": "Gripe: infectologista explica o que alivia e o que é mito",
+            "link": "https://example.org/noticias/gripe-mitos",
+            "pubDate": "Thu, 05 Nov 2026 10:00:00 GMT",
+            "source": "Jornal Exemplo",
+            "sourceDomain": "example.org",
+            "recencyScore": 1
+          }
+        ]
+      }
+    },
+    {
+      "question": "O posto de saúde do bairro vai vacinar contra a gripe neste sábado?",
+      "type": "TEXTO",
+      "result": {
+        "inputType": "texto",
+        "verdict": "nao_verificado",
+        "confidence": 0.4,
+        "summary": "[Exemplo sintético] Não foi possível verificar: as fontes do exemplo não trazem informação sobre vacinação contra a gripe nesse posto de saúde neste sábado.",
+        "reasons": [
+          "Nenhuma checagem do exemplo trata de vacinação nesse posto de saúde.",
+          "A única notícia do exemplo (Jornal Exemplo, fonte fictícia, 10/11/2026) fala da campanha nacional, sem datas por bairro.",
+          "Datas e locais de vacinação são definidos pela Secretaria Municipal de Saúde, que é a fonte adequada para confirmar."
+        ],
+        "reply": "Este relatório é um exemplo sintético, criado para demonstrar a interface; as fontes e os links são fictícios. A pergunta trata de um evento local que as fontes do exemplo não cobrem, por isso o resultado é \"não verificado\", e não \"falso\". Para saber se haverá vacinação no sábado, confirme com o posto de saúde ou com a Secretaria Municipal de Saúde, pelos canais oficiais.",
+        "claimQuery": "vacinação gripe posto de saúde sábado",
+        "factChecks": [],
+        "recentNews": [
+          {
+            "title": "Campanha de vacinação contra a gripe começa em todo o país",
+            "link": "https://example.org/noticias/campanha-gripe",
+            "pubDate": "Tue, 10 Nov 2026 09:00:00 GMT",
+            "source": "Jornal Exemplo",
+            "sourceDomain": "example.org",
+            "recencyScore": 1
+          }
+        ]
+      }
+    },
+    {
+      "question": "Lavar as mãos com água e sabão ajuda a evitar doenças?",
+      "type": "TEXTO",
+      "result": {
+        "inputType": "texto",
+        "verdict": "provavelmente_verdadeiro",
+        "confidence": 0.9,
+        "summary": "[Exemplo sintético] Provavelmente verdadeiro: as fontes do exemplo concordam que lavar as mãos com água e sabão reduz a transmissão de várias infecções.",
+        "reasons": [
+          "A Agência Exemplo de Checagem (fonte fictícia) classificou como verdadeira, em 20/10/2026, a afirmação de que lavar as mãos ajuda a prevenir doenças.",
+          "O Jornal Exemplo (fonte fictícia) noticiou em 15/10/2026 a recomendação de lavar as mãos por pelo menos 20 segundos, sobretudo antes de comer e depois de usar o banheiro.",
+          "As duas fontes do exemplo descrevem a lavagem das mãos como medida simples contra diarreias e infecções respiratórias."
+        ],
+        "reply": "Este relatório é um exemplo sintético, criado para demonstrar a interface; as fontes e os links são fictícios. A afirmação é consistente com as fontes do exemplo: lavar as mãos com água e sabão ajuda a evitar a transmissão de várias doenças. A recomendação prática é lavar as mãos por pelo menos 20 segundos antes de comer, antes de cuidar de crianças e depois de usar o banheiro.",
+        "claimQuery": "lavar as mãos previne doenças",
+        "factChecks": [
+          {
+            "text": "Lavar as mãos com água e sabão previne doenças",
+            "claimant": "Cartaz de unidade de saúde (exemplo)",
+            "claimDate": "2026-10-18",
+            "reviews": [
+              {
+                "publisher": "Agência Exemplo de Checagem",
+                "title": "É verdade que lavar as mãos ajuda a prevenir doenças",
+                "textualRating": "Verdadeiro",
+                "url": "https://example.org/checagem/lavar-as-maos",
+                "reviewDate": "2026-10-20",
+                "domain": "example.org",
+                "recencyScore": 1
+              }
+            ]
+          }
+        ],
+        "recentNews": [
+          {
+            "title": "Lavar as mãos: veja quando e como fazer",
+            "link": "https://example.org/noticias/lavar-as-maos",
+            "pubDate": "Thu, 15 Oct 2026 08:00:00 GMT",
+            "source": "Jornal Exemplo",
+            "sourceDomain": "example.org",
+            "recencyScore": 1
+          }
+        ]
+      }
+    }
+  ]
+}
