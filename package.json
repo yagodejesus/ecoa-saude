@@ -1,6 +1,6 @@
 {
   "name": "Ecoa saude",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Verificação de fatos + Detecção de IA em imagens e vídeos",
   "main": "app.js",
   "license": "MIT",
